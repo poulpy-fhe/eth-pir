@@ -1,0 +1,20 @@
+[package]
+name = "eth-pir"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+poulpy-pir = { path = "../poulpy-pir" }
+poulpy-cpu-avx = { git = "https://github.com/poulpy-fhe/poulpy", rev = "f1dc3d4e04394ce9cba2aa396cc0fe19be4645ed", features = ["enable-avx"], optional = true }
+poulpy-cpu-avx512 = { git = "https://github.com/poulpy-fhe/poulpy", rev = "f1dc3d4e04394ce9cba2aa396cc0fe19be4645ed", features = ["enable-avx512f"], optional = true }
+
+[features]
+default = ["avx2-fhe"]
+avx2-fhe = ["dep:poulpy-cpu-avx"]
+avx512-fhe = ["dep:poulpy-cpu-avx512"]
+cblas-gemm = ["poulpy-pir/cblas-gemm"]
+numa-db-interleave = ["poulpy-pir/numa-db-interleave"]
+
+[[example]]
+name = "eth_pir"
+path = "examples/eth_pir.rs"
