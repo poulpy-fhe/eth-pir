@@ -2,7 +2,7 @@
 
 ETH token-balance PIR service layer based on `poulpy-pir`.
 
-This crate depends on the adjacent `../poulpy-pir` crate and packages its
+This crate depends on `poulpy-pir` crate and packages its
 index-based PIR core plus keyword directory into a fixed-shape service:
 
 - construction: InsPIRe2 recursion,
