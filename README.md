@@ -86,6 +86,44 @@ tuning currently treats interleaving as the single-query-latency choice.
 Cold start and post-rebuild resync use `KeywordWire::full()` and
 `EthPirClient::{new,resync}`.
 
+### Keyword Directory Size
+
+The keyword directory lets clients map an ETH address to the PIR record index
+without downloading the address set. Its base structure is a minimal perfect
+hash function (MPHF): the server builds it once over the address set, ships only
+the MPHF parameters, and both sides then compute the same `address -> index`
+mapping locally.
+
+The current MPHF parameters cost about **2.116 bits/address** on the wire. In
+the 16 M-address example run, client bootstrap downloaded:
+
+```text
+4,231,252 bytes = 4.04 MiB = 2.116 bits/address
+```
+
+A naive downloadable index would be much larger because the client would need
+the addresses, not just integer slots:
+
+```text
+16,000,000 addresses
+
+MPHF parameters                 4,231,252 B    4.04 MiB
+address list, index by position 320,000,000 B  305.18 MiB
+address -> u32 index table      384,000,000 B  366.21 MiB
+```
+
+So for 16 M addresses, the MPHF is roughly **76x smaller** than downloading the
+address list in slot order, and roughly **91x smaller** than downloading
+`address -> u32 index` pairs.
+
+At the full 2 GiB shape capacity of 33,554,432 addresses, the same MPHF density
+would be about **8.46 MiB**, while a naive address list would be **640 MiB** and
+an `address -> u32 index` table would be **768 MiB**.
+
+Only addresses added after the last MPHF rebuild are sent as a delta overlay.
+Each delta key costs 20 bytes until the next index rebuild compacts it back into
+the MPHF.
+
 Incremental sync uses `KeywordWire::delta_from(client.delta_len())` and
 `EthPirClient::apply_delta`. The delta is a validated envelope:
 
