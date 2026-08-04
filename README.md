@@ -141,20 +141,32 @@ The client rejects stale versions, wrong offsets, mismatched base lengths,
 capacity mismatches, over-capacity payloads, invalid magic, and duplicate keys
 within the delta overlay.
 
-## Index Rebuilds
+Between MPHF rebuilds, newly inserted addresses live in this append-only delta
+overlay. A client can download only the delta tail, learn the new
+address-to-index entries, and query those addresses after the server flushes the
+matching records with `EthPirServer::flush_records()`. The MPHF rebuild is a
+later compaction step, not a prerequisite for querying recently appended
+addresses.
 
-`EthPirServer::prepare_index_rebuild()` rebuilds the MPHF and permutes the
-plaintext record vector without publishing anything. The live keyword helper and
-serving PIR snapshot remain on the old version, so this phase can be measured
-separately.
+## Flushes
 
-`EthPirServer::publish_index_rebuild(prepared)` installs the prepared directory
-and rebuilds the matching PIR snapshot. This database rebuild is required before
-clients resync: a new MPHF changes the indices clients query, and those indices
-must match the physical database layout.
+There are two separate flushes:
 
-`EthPirServer::rebuild_index()` remains the one-shot safe API and performs both
-phases.
+- `EthPirServer::flush_records()` rebuilds the PIR database from the current
+  keyword helper plus pending updates. It keeps the current MPHF and append-only
+  delta overlay. Use this for the common path where newly inserted addresses
+  should become queryable before MPHF compaction.
+- `EthPirServer::flush_keyword_helper()` rebuilds the MPHF over the complete
+  current key set, permutes records into the new MPHF order, rebuilds the PIR
+  database, reruns offline preprocessing, and publishes the new directory
+  version. Use this when the append-only delta has grown large enough to compact.
+
+For measurements, `prepare_keyword_helper_flush()` does the MPHF rebuild plus
+plaintext record permutation without publishing, and
+`publish_keyword_helper_flush(prepared)` performs the required database rebuild
+and version publication. The older `flush_queue()` and `rebuild_index()` names
+remain as compatibility wrappers for `flush_records()` and
+`flush_keyword_helper()`.
 
 ## Repository Layout
 
@@ -162,4 +174,5 @@ phases.
 - `src/server.rs`: `EthPirServer`, `EthPirResponder`, `KeywordWire`.
 - `src/client.rs`: `EthPirClient`, lookup state, decrypt verification.
 - `examples/eth_pir.rs`: 16 M initial-address demo on the 2 GiB shape, with 1 M
-  balance updates and 50 K inserted addresses.
+  balance updates, 50 K inserted addresses, record flush, append-only delta
+  lookup, and keyword-helper compaction.

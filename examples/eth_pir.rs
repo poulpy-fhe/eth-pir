@@ -50,8 +50,8 @@
 //! Always use `--release`: debug builds are dramatically slower. The demo
 //! starts with 16 M addresses in the fixed `InsPIRe2-g32-2GiB-c65536` shape,
 //! then queues 1 M balance updates and 50 K inserted addresses. Flush and
-//! rebuilt-index publication briefly hold two serving snapshots; expect peak RSS
-//! to be roughly double the previous 1 GiB run.
+//! keyword-helper compaction briefly holds two serving snapshots; expect peak
+//! RSS to be roughly double the previous 1 GiB run.
 //!
 //! What this exercises:
 //!
@@ -60,9 +60,9 @@
 //! - a private lookup and address-in-record verification,
 //! - 1 M queued balance updates plus 50 K new-key insertions,
 //! - validated keyword delta sync before flush,
-//! - full snapshot flush,
-//! - MPHF rebuild preparation,
-//! - rebuilt-index publication and client resync,
+//! - record flush against the current keyword helper,
+//! - append-only delta lookup before MPHF rebuild,
+//! - keyword-helper flush and client resync,
 //! - peak RSS reporting from `/proc/self/status` on Linux.
 
 use std::collections::HashMap;
@@ -206,39 +206,55 @@ fn main() {
         server.pending()
     );
 
-    // - Step 7: flush queued writes into a new serving snapshot.
+    // - Step 7: flush queued records into a new serving snapshot.
     // - Apply pending balances to plaintext records.
-    // - Re-encode the database, rerun offline preprocessing, and atomically swap
-    //   the responder snapshot.
+    // - Rebuild the PIR database from the current keyword helper: base MPHF plus
+    //   append-only delta.
+    // - Rerun offline preprocessing and atomically swap the responder snapshot.
+    // - Do not rebuild the MPHF.
     // - Queued writes are not visible to PIR responses until the
     //   encrypted/preprocessed database has been rebuilt.
-    // - After the swap, clients using the already-applied keyword delta can
-    //   retrieve updated and newly inserted records.
+    // - After the swap, clients can retrieve updated records; inserted records
+    //   are exercised in the next step through the append-only delta path.
     let t = Instant::now();
-    server.flush_queue();
-    println!("FLUSH (re-encode + offline)      : {:?}", t.elapsed());
+    server.flush_records();
+    println!("FLUSH RECORDS (DB+offline)       : {:?}", t.elapsed());
     assert_eq!(
         lookup(&server, &mut client, sample_existing),
         Ok(updated_balance_of(&sample_existing))
     );
-    assert_eq!(
-        lookup(&server, &mut client, sample_new),
-        Ok(balance_of(&sample_new))
-    );
-    println!("  post-flush: sample update + sample insert verify");
+    println!("  post-flush: sample update verifies");
 
-    // - Step 8: prepare a rebuilt keyword index.
+    // - Step 8: query an appended address before rebuilding the MPHF.
+    // - Keep both server and client on directory version 0.
+    // - Use only the append-only delta downloaded in Step 6 to map the new
+    //   address to its post-MPHF index.
+    // - Demonstrate the intended steady-state path between MPHF rebuilds:
+    //   clients fetch small delta tails for new addresses and can query those
+    //   addresses after the server flushes the matching records.
+    assert_eq!(server.keyword().version(), 0);
+    assert_eq!(client.version(), 0);
+    let t = Instant::now();
+    let inserted_balance =
+        lookup(&server, &mut client, sample_new).expect("new address via append-only delta");
+    println!("lookup appended address (delta)  : {:?}", t.elapsed());
+    assert_eq!(inserted_balance, balance_of(&sample_new));
+    println!("  append-only delta lookup verifies");
+
+    // - Step 9: prepare a keyword-helper flush.
     // - Construct a fresh MPHF over the complete key set.
     // - Permute records into the new MPHF order.
     // - Keep the live keyword directory and serving snapshot unchanged.
     // - Compacting the delta overlay back into the MPHF keeps lookup state small
     //   and lookup behavior predictable.
     let t = Instant::now();
-    let prepared = server.prepare_index_rebuild().expect("prepare rebuild");
-    println!("REBUILD INDEX (MPHF+permute)     : {:?}", t.elapsed());
+    let prepared = server
+        .prepare_keyword_helper_flush()
+        .expect("prepare keyword-helper flush");
+    println!("PREPARE KEYWORD (MPHF+permute)   : {:?}", t.elapsed());
     assert_eq!(server.keyword().version(), 0);
 
-    // - Step 9: publish the rebuilt index.
+    // - Step 10: publish the keyword-helper flush.
     // - Re-encode the database in the prepared MPHF order.
     // - Rerun offline preprocessing and atomically swap the responder snapshot.
     // - Publish the directory version only after the PIR snapshot matches it.
@@ -247,12 +263,12 @@ fn main() {
     //   physical layout.
     let t = Instant::now();
     server
-        .publish_index_rebuild(prepared)
-        .expect("publish rebuild");
-    println!("PUBLISH INDEX (re-encode+offline): {:?}", t.elapsed());
+        .publish_keyword_helper_flush(prepared)
+        .expect("publish keyword-helper flush");
+    println!("FLUSH KEYWORD (DB+offline)       : {:?}", t.elapsed());
     assert_eq!(server.keyword().version(), 1);
 
-    // - Step 10: resynchronize the client after an MPHF rebuild.
+    // - Step 11: resynchronize the client after an MPHF rebuild.
     // - Download a fresh full directory.
     // - Replace the client's old version-0 mapping with the version-1 mapping.
     // - After rebuild, indices may change; a client that kept the old MPHF would
@@ -270,7 +286,7 @@ fn main() {
     );
     println!("  post-rebuild: sample lookups verify");
 
-    // - Step 11: report peak resident memory when running on Linux.
+    // - Step 12: report peak resident memory when running on Linux.
     // - Read `/proc/self/status` and print VmHWM if available.
     // - This example intentionally exercises a large real-shape database.
     // - Peak memory is one of the first production capacity signals to check

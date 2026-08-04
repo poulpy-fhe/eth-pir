@@ -10,7 +10,9 @@ mod client;
 mod server;
 
 pub use client::{EthPirClient, LookupState};
-pub use server::{EthPirResponder, EthPirServer, KeywordWire, PreparedIndexRebuild};
+pub use server::{
+    EthPirResponder, EthPirServer, KeywordWire, PreparedIndexRebuild, PreparedKeywordHelperFlush,
+};
 
 use poulpy_pir::config::{Collapse, Config};
 use poulpy_pir::database::DatabaseLayout;

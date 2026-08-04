@@ -64,7 +64,7 @@ impl EthPirServer {
     ///
     /// New addresses are appended to the keyword helper immediately and become
     /// visible through delta sync. Their balances become retrievable after the
-    /// next `flush_queue`.
+    /// next [`flush_records`](Self::flush_records).
     pub fn queue_new_update(&mut self, addr: Address, value: Balance) -> Result<(), EthPirError> {
         if !self.queue.contains_key(&addr) {
             let known = self.records[self.directory.index(&addr)][..20] == addr;
@@ -79,22 +79,34 @@ impl EthPirServer {
         Ok(())
     }
 
-    /// Applies queued updates and swaps in a freshly built serving snapshot.
-    pub fn flush_queue(&mut self) {
+    /// Rebuilds the PIR database from the current keyword helper plus pending
+    /// record updates.
+    ///
+    /// This does **not** rebuild the MPHF. New addresses already live in the
+    /// keyword helper's append-only delta, so clients that applied the delta can
+    /// query them after this flush. Use
+    /// [`flush_keyword_helper`](Self::flush_keyword_helper) only when the delta
+    /// should be compacted back into a fresh MPHF.
+    pub fn flush_records(&mut self) {
         if self.apply_queue() {
             self.install_snapshot();
             self.epoch = self.epoch.wrapping_add(1);
         }
     }
 
+    /// Backward-compatible name for [`flush_records`](Self::flush_records).
+    pub fn flush_queue(&mut self) {
+        self.flush_records();
+    }
+
     /// Builds a fresh MPHF and permutes records for it, without publishing.
     ///
-    /// This is the cheap half of index compaction. It does not change
+    /// This is the cheap half of keyword-helper compaction. It does not change
     /// `keyword()`, the serving snapshot, or the pending queue, so the live
     /// server remains consistent while the work is being measured or staged.
-    /// Call [`publish_index_rebuild`](Self::publish_index_rebuild) to rebuild
-    /// the PIR snapshot and publish the new directory version.
-    pub fn prepare_index_rebuild(&self) -> Result<PreparedIndexRebuild, EthPirError> {
+    /// Call [`publish_keyword_helper_flush`](Self::publish_keyword_helper_flush)
+    /// to rebuild the PIR snapshot and publish the new directory version.
+    pub fn prepare_keyword_helper_flush(&self) -> Result<PreparedKeywordHelperFlush, EthPirError> {
         let keys: Vec<Address> = self
             .records
             .iter()
@@ -108,22 +120,29 @@ impl EthPirServer {
                 None => *record,
             };
         }
-        Ok(PreparedIndexRebuild {
+        Ok(PreparedKeywordHelperFlush {
             epoch: self.epoch,
             directory: next,
             records,
         })
     }
 
-    /// Publishes a prepared index rebuild and installs its matching snapshot.
+    /// Backward-compatible name for
+    /// [`prepare_keyword_helper_flush`](Self::prepare_keyword_helper_flush).
+    pub fn prepare_index_rebuild(&self) -> Result<PreparedKeywordHelperFlush, EthPirError> {
+        self.prepare_keyword_helper_flush()
+    }
+
+    /// Publishes a prepared keyword-helper flush and installs its matching
+    /// snapshot.
     ///
     /// Publishing still has to re-encode the PIR database and rerun offline
     /// preprocessing: a re-derived MPHF changes the indices clients query, so
     /// the serving database must be laid out the same way before the new
     /// directory version becomes visible.
-    pub fn publish_index_rebuild(
+    pub fn publish_keyword_helper_flush(
         &mut self,
-        prepared: PreparedIndexRebuild,
+        prepared: PreparedKeywordHelperFlush,
     ) -> Result<(), EthPirError> {
         if prepared.epoch != self.epoch {
             return Err(EthPirError::StalePreparedRebuild);
@@ -136,16 +155,34 @@ impl EthPirServer {
         Ok(())
     }
 
-    /// Rebuilds the MPHF, permutes records, and publishes the matching snapshot.
+    /// Backward-compatible name for
+    /// [`publish_keyword_helper_flush`](Self::publish_keyword_helper_flush).
+    pub fn publish_index_rebuild(
+        &mut self,
+        prepared: PreparedKeywordHelperFlush,
+    ) -> Result<(), EthPirError> {
+        self.publish_keyword_helper_flush(prepared)
+    }
+
+    /// Rebuilds the keyword helper's MPHF and publishes the matching PIR
+    /// database snapshot.
     ///
-    /// This is the production-safe one-shot API. Use
-    /// [`prepare_index_rebuild`](Self::prepare_index_rebuild) plus
-    /// [`publish_index_rebuild`](Self::publish_index_rebuild) when measuring the
-    /// MPHF rebuild separately from the required database publication work.
-    pub fn rebuild_index(&mut self) -> Result<(), EthPirError> {
-        let prepared = self.prepare_index_rebuild()?;
-        self.publish_index_rebuild(prepared)?;
+    /// This is the production-safe compaction API: it rebuilds the MPHF over the
+    /// complete current key set, permutes records into the new MPHF order,
+    /// rebuilds the PIR database, reruns offline preprocessing, and only then
+    /// publishes the new directory version. Use
+    /// [`flush_records`](Self::flush_records) for the common append-only path
+    /// that keeps the current MPHF plus delta overlay.
+    pub fn flush_keyword_helper(&mut self) -> Result<(), EthPirError> {
+        let prepared = self.prepare_keyword_helper_flush()?;
+        self.publish_keyword_helper_flush(prepared)?;
         Ok(())
+    }
+
+    /// Backward-compatible name for
+    /// [`flush_keyword_helper`](Self::flush_keyword_helper).
+    pub fn rebuild_index(&mut self) -> Result<(), EthPirError> {
+        self.flush_keyword_helper()
     }
 
     /// Answer one query against the current snapshot.
@@ -221,17 +258,20 @@ impl EthPirServer {
     }
 }
 
-/// A staged MPHF compaction that has not been published yet.
+/// A staged keyword-helper compaction that has not been published yet.
 ///
 /// While this value exists, the live server still exposes the old keyword
 /// directory and old serving snapshot. It must be passed back to
-/// [`EthPirServer::publish_index_rebuild`] before clients should resync to the
-/// rebuilt directory version.
-pub struct PreparedIndexRebuild {
+/// [`EthPirServer::publish_keyword_helper_flush`] before clients should resync
+/// to the rebuilt directory version.
+pub struct PreparedKeywordHelperFlush {
     epoch: u64,
     directory: KeywordDirectory<20>,
     records: Vec<Record>,
 }
+
+/// Backward-compatible name for [`PreparedKeywordHelperFlush`].
+pub type PreparedIndexRebuild = PreparedKeywordHelperFlush;
 
 /// Cloneable database-service handle.
 pub struct EthPirResponder {
