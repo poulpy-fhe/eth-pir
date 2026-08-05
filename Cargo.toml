@@ -24,7 +24,7 @@ include = [
 ]
 
 [dependencies]
-poulpy-pir = { version = "0.1.0", path = "../poulpy-pir" }
+poulpy-pir = { version = "0.1.0", git = "https://github.com/poulpy-fhe/poulpy-pir", tag = "v0.1.0" }
 poulpy-cpu-ref = { version = "0.7.0", features = ["enable-core"] }
 poulpy-cpu-avx = { version = "0.7.0", features = ["enable-avx"], optional = true }
 poulpy-cpu-avx512 = { version = "0.7.0", features = ["enable-avx512f"], optional = true }

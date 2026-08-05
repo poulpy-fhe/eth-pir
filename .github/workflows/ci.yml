@@ -4,12 +4,19 @@ on:
   push:
   pull_request:
 
+# poulpy-hal uses #![feature(trait_alias)], so the whole tree needs the
+# nightly pinned in rust-toolchain.toml (rustup reads it automatically).
+# poulpy-pir is a git dependency pinned to a release tag in Cargo.toml, so
+# changes on poulpy-pir main cannot break this crate; bump the tag to update.
 jobs:
   portable:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-05-14
+          components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo check --all-targets
       - run: cargo clippy --all-targets -- -D warnings
@@ -20,7 +27,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-05-14
+          components: rustfmt, clippy
       - run: RUSTFLAGS="-C target-feature=+avx2,+fma" cargo check --all-targets --features avx2-fhe
       - run: RUSTFLAGS="-C target-feature=+avx2,+fma" cargo clippy --all-targets --features avx2-fhe -- -D warnings
       - run: RUSTFLAGS="-C target-feature=+avx2,+fma" cargo test --release --lib --features avx2-fhe

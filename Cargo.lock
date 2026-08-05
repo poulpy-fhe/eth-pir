@@ -1085,6 +1085,7 @@ dependencies = [
 [[package]]
 name = "poulpy-pir"
 version = "0.1.0"
+source = "git+https://github.com/poulpy-fhe/poulpy-pir?tag=v0.1.0#2a1dffea4ae733d651cab9dde75bfe2ca824b082"
 dependencies = [
  "epserde 0.13.1",
  "getrandom",

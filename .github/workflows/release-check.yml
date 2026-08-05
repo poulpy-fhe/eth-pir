@@ -3,12 +3,22 @@ name: Release Check
 on:
   workflow_dispatch:
 
+# poulpy-hal uses #![feature(trait_alias)], so the whole tree needs the
+# nightly pinned in rust-toolchain.toml (rustup reads it automatically).
+# poulpy-pir is a git dependency pinned to a release tag in Cargo.toml, so
+# changes on poulpy-pir main cannot break this crate; bump the tag to update.
+# Note that
+# `cargo package` resolves poulpy-pir from crates.io (git sources are
+# stripped when packaging), so it can only pass once poulpy-pir is published.
 jobs:
   release-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-05-14
+          components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --release --lib
