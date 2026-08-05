@@ -97,7 +97,7 @@ tuning currently treats interleaving as the single-query-latency choice.
 
 ## Performance
 
-One AWS **c8i.32xlarge** (Intel Xeon 6975P-C, 64 cores, 256 GiB), serving
+One AWS **c8i.32xlarge** (Intel Xeon 6975P-C, 64 cores, 247 GiB), serving
 **16 M ETH addresses** from a 2 GiB database with capacity for 33.5 M:
 
 | | |
@@ -138,20 +138,19 @@ The worker budget is the detected CPU count capped at 64 — one per physical
 core. SMT gains 6% on the offline precompute but costs 10% online latency and
 10.6 GiB of peak RSS, so it is off by default; `PIR_THREADS` overrides it.
 
-For a full per-phase breakdown — wall time, CPU time and effective thread count
-for every step, plus the memory accounting — run the two examples:
+The example prints the per-phase breakdown behind most of these numbers — init
+and rebuild timings, wire sizes, and the memory accounting against measured
+VmHWM:
 
 ```sh
 RUSTFLAGS="-C target-feature=+avx512f,+avx512dq" \
 cargo run --release --no-default-features \
   --features "avx512-fhe,cblas-gemm,numa-db-interleave" \
-  --example eth_pir     # end-to-end, with timings, wire sizes and memory
-
-RUSTFLAGS="-C target-feature=+avx512f,+avx512dq" \
-cargo run --release --no-default-features \
-  --features "avx512-fhe,cblas-gemm,numa-db-interleave" \
-  --example eth_trace   # per-phase parallelism audit and batch sweep
+  --example eth_pir
 ```
+
+It measures batch 32 and 64; the batch-8/128/256 figures and the 64-vs-128
+worker comparison come from a wider sweep that is not part of the repository.
 
 ## Sync Contract
 
@@ -361,4 +360,3 @@ pub struct MemoryReport {   // serving_database, staging_database, precomputatio
   balance updates, 50 K inserted addresses, batched lookups, a database rebuild
   under concurrent query load, append-only delta lookup, and a keyword-index
   rebuild.
-- `examples/eth_trace.rs`: per-phase parallelism audit and batch sweep.
