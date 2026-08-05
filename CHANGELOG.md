@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 - Unreleased
+## 0.1.0
 
 - Added release metadata and release-readiness documentation.
 - Made portable reference-backend builds the default.
