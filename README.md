@@ -378,3 +378,7 @@ pub struct MemoryReport {   // serving_database, staging_database, precomputatio
   balance updates, 50 K inserted addresses, batched lookups, a database rebuild
   under concurrent query load, append-only delta lookup, and a keyword-index
   rebuild.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
