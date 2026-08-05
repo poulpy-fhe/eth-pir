@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-poulpy-pir = { path = "../poulpy-pir" }
+poulpy-pir = { git = "https://github.com/poulpy-fhe/poulpy-pir", rev = "06ffe1efe32b04e763a35701706a833f2d050248"}
 poulpy-cpu-avx = { git = "https://github.com/poulpy-fhe/poulpy", rev = "f1dc3d4e04394ce9cba2aa396cc0fe19be4645ed", features = ["enable-avx"], optional = true }
 poulpy-cpu-avx512 = { git = "https://github.com/poulpy-fhe/poulpy", rev = "f1dc3d4e04394ce9cba2aa396cc0fe19be4645ed", features = ["enable-avx512f"], optional = true }
 

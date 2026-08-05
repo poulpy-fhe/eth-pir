@@ -11,7 +11,8 @@ mod server;
 
 pub use client::{EthPirClient, LookupState};
 pub use server::{
-    EthPirResponder, EthPirServer, KeywordWire, PreparedIndexRebuild, PreparedKeywordHelperFlush,
+    EthPirResponder, EthPirServer, InitTimings, KeywordRebuildTimings, KeywordWire, MemoryReport,
+    RefreshTimings,
 };
 
 use poulpy_pir::config::{Collapse, Config};
@@ -58,8 +59,6 @@ pub fn default_shape() -> (Config<U512P65536>, DatabaseLayout<U512P65536>) {
 pub enum EthPirError {
     /// The decrypted record's address does not match the queried address.
     NotInSet,
-    /// A prepared index rebuild was made against an older server state.
-    StalePreparedRebuild,
     /// Forwarded from the keyword layer.
     Keyword(KeywordError<20>),
 }
@@ -74,9 +73,6 @@ impl std::fmt::Display for EthPirError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotInSet => write!(f, "address not in the served set"),
-            Self::StalePreparedRebuild => {
-                write!(f, "prepared index rebuild no longer matches server state")
-            }
             Self::Keyword(e) => write!(f, "keyword layer: {e}"),
         }
     }

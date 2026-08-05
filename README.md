@@ -60,6 +60,20 @@ cargo run --release --no-default-features \
   --example eth_pir
 ```
 
+### Worker count
+
+The worker budget is the auto-detected CPU count capped at **64**, one per
+physical core; see [Performance](#performance) for why SMT is not worth it here.
+`PIR_THREADS` overrides it in either direction and is not capped:
+
+```sh
+PIR_THREADS=32 cargo run --release --example eth_pir
+```
+
+It sizes both `poulpy-pir`'s internal parallelism and `eth-pir`'s own bulk record
+loops, so one variable scales the whole run. It also sizes the online scratch
+pool, which is the largest single allocation the server makes.
+
 Install the optimized pthread OpenBLAS development package before enabling
 `cblas-gemm`:
 
@@ -80,6 +94,64 @@ CBLAS providers such as GSL CBLAS are not the intended performance path.
 
 Leave `numa-db-interleave` off for batched serving; `poulpy-pir`'s measured
 tuning currently treats interleaving as the single-query-latency choice.
+
+## Performance
+
+One AWS **c8i.32xlarge** (Intel Xeon 6975P-C, 64 cores, 256 GiB), serving
+**16 M ETH addresses** from a 2 GiB database with capacity for 33.5 M:
+
+| | |
+| --- | --- |
+| **private lookup** | **114 ms** |
+| **throughput, batched** | **40 queries/s** (batch 128) |
+| client download, one-time | 4.05 MiB — 2.116 bits/address (16mio addresses) |
+| query / response on the wire | 675 KiB / 192 KiB |
+| absorb 1.05 M balance updates | 0.30 s |
+| publish them, zero downtime | 4.4 s (5.2 s while serving) |
+| server cold start | 17 s |
+| memory | 16 GiB steady, 25 GiB peak (30 GiB with batching) |
+
+Nothing is precomputed per client and nothing is cached per query: every lookup
+is a full private read of the whole database, and the server never learns which
+address was asked for.
+
+**Updates are cheap and never take the service offline.** Balance updates land in
+plaintext immediately; publishing them re-encodes the database and reruns the
+query-independent precomputation off to the side, then swaps the two in as a
+pair under a lock held for microseconds. The example keeps a query load running
+across the whole rebuild and asserts every response decodes to either the old or
+the new balance — a database swapped in without its matching precomputation
+fails the run.
+
+**Batch size is a throughput/latency dial.** Every query in a batch waits for the
+whole batch, so 8.7 q/s unbatched becomes 33.7 q/s at batch 64 (1.9 s latency)
+and 40 q/s at batch 128 (3.2 s), for about +5 GiB of peak memory. Pick it from
+the latency budget.
+
+**Compaction is the one slow path**, and it is optional: `rebuild_keyword_index`
+takes 11.4 s, of which 6.8 s is MPHF construction and 4.4 s the database rebuild
+it ends with. Until you run it, new addresses stay queryable through a
+20 B/address delta, which is cheaper than refetching the 4.05 MiB MPHF for
+~212 K inserts.
+
+The worker budget is the detected CPU count capped at 64 — one per physical
+core. SMT gains 6% on the offline precompute but costs 10% online latency and
+10.6 GiB of peak RSS, so it is off by default; `PIR_THREADS` overrides it.
+
+For a full per-phase breakdown — wall time, CPU time and effective thread count
+for every step, plus the memory accounting — run the two examples:
+
+```sh
+RUSTFLAGS="-C target-feature=+avx512f,+avx512dq" \
+cargo run --release --no-default-features \
+  --features "avx512-fhe,cblas-gemm,numa-db-interleave" \
+  --example eth_pir     # end-to-end, with timings, wire sizes and memory
+
+RUSTFLAGS="-C target-feature=+avx512f,+avx512dq" \
+cargo run --release --no-default-features \
+  --features "avx512-fhe,cblas-gemm,numa-db-interleave" \
+  --example eth_trace   # per-phase parallelism audit and batch sweep
+```
 
 ## Sync Contract
 
@@ -124,8 +196,8 @@ Only addresses added after the last MPHF rebuild are sent as a delta overlay.
 Each delta key costs 20 bytes until the next index rebuild compacts it back into
 the MPHF.
 
-Incremental sync uses `KeywordWire::delta_from(client.delta_len())` and
-`EthPirClient::apply_delta`. The delta is a validated envelope:
+Incremental sync uses `KeywordWire::tail(client.tail_len())` and
+`EthPirClient::apply_tail`. The tail is a validated envelope:
 
 ```text
 magic             8 bytes: "PIRDLT1\0"
@@ -143,30 +215,142 @@ within the delta overlay.
 
 Between MPHF rebuilds, newly inserted addresses live in this append-only delta
 overlay. A client can download only the delta tail, learn the new
-address-to-index entries, and query those addresses after the server flushes the
-matching records with `EthPirServer::flush_records()`. The MPHF rebuild is a
+address-to-index entries, and query those addresses after the server rebuilds the
+matching records with `EthPirServer::rebuild_database()`. The MPHF rebuild is a
 later compaction step, not a prerequisite for querying recently appended
 addresses.
 
-## Flushes
+## Rebuilds
 
-There are two separate flushes:
+Updates are applied to the plaintext records immediately and become retrievable
+at the next rebuild. There are two, and they differ only in whether the MPHF is
+touched:
 
-- `EthPirServer::flush_records()` rebuilds the PIR database from the current
-  keyword helper plus pending updates. It keeps the current MPHF and append-only
-  delta overlay. Use this for the common path where newly inserted addresses
-  should become queryable before MPHF compaction.
-- `EthPirServer::flush_keyword_helper()` rebuilds the MPHF over the complete
-  current key set, permutes records into the new MPHF order, rebuilds the PIR
-  database, reruns offline preprocessing, and publishes the new directory
-  version. Use this when the append-only delta has grown large enough to compact.
+- `rebuild_database()` re-encodes the served database from the current records
+  and reruns the precomputation. It keeps the current MPHF and its append-only
+  delta, so newly inserted addresses become queryable without a client resync.
+  This is the common path: ~4.4 s, zero downtime.
+- `rebuild_keyword_index()` derives a fresh MPHF over the complete key set,
+  permutes the records into its order, then rebuilds the database so the served
+  layout matches, and only then publishes the new directory version. Every index
+  moves, so clients must `resync()` afterwards. Run it when the delta has grown
+  enough to be worth compacting — ~11.4 s, dominated by MPHF construction.
 
-For measurements, `prepare_keyword_helper_flush()` does the MPHF rebuild plus
-plaintext record permutation without publishing, and
-`publish_keyword_helper_flush(prepared)` performs the required database rebuild
-and version publication. The older `flush_queue()` and `rebuild_index()` names
-remain as compatibility wrappers for `flush_records()` and
-`flush_keyword_helper()`.
+Both return their per-step timings. `rebuild_database` returns `None` when
+nothing was pending.
+
+## API
+
+```rust
+// ---- Shared types -------------------------------------------------------
+
+pub type Address = [u8; 20];                 // an ETH address: the keyword
+pub type Balance = [u8; 32];                 // a token balance: little-endian u256
+pub type DefaultBackend = ...;               // FFT64Avx, or FFT64Avx512 with `avx512-fhe`
+pub type EthQuery = ...;                     // an encrypted lookup, opaque to the server
+pub type EthResponse = ...;                  // the encrypted answer
+
+/// The fixed deployment shape: `InsPIRe2-g32-2GiB-c65536`, 33,554,432 addresses.
+pub fn default_shape() -> (Config<U512P65536>, DatabaseLayout<U512P65536>);
+
+pub enum EthPirError {
+    NotInSet,                    // the record returned does not carry the queried address
+    Keyword(KeywordError<20>),
+}
+
+// ---- Server -------------------------------------------------------------
+
+impl EthPirServer {
+    /// Build the service from an address -> balance map. Derives the MPHF, places
+    /// records, encodes the database, materializes the CRS masks and runs the
+    /// first precomputation. Everything here is paid once.
+    pub fn init(map: &HashMap<Address, Balance>) -> Result<Self, EthPirError>;
+    pub fn init_with(config, layout, map) -> Result<Self, EthPirError>;
+    pub fn init_with_timed(config, layout, map) -> Result<(Self, InitTimings), EthPirError>;
+
+    /// Apply one balance update. Written to the plaintext records immediately;
+    /// retrievable only after the next `rebuild_database`. New addresses are appended
+    /// to the keyword delta and are visible to clients that sync it.
+    pub fn update(&mut self, addr: Address, value: Balance) -> Result<(), EthPirError>;
+
+    /// Publish everything applied since the last rebuild: re-encode the database,
+    /// rerun the precomputation off to the side, swap the pair in. Keeps the
+    /// current MPHF, so no client resync is needed. Queries are served
+    /// throughout. `None` if nothing was pending.
+    pub fn rebuild_database(&mut self) -> Option<RefreshTimings>;
+
+    /// Compact the append-only delta into a fresh MPHF, permute the records, and
+    /// rebuild the database to match, publishing the new directory version last.
+    /// Every index moves, so clients must `resync()` afterwards.
+    pub fn rebuild_keyword_index(&mut self) -> Result<KeywordRebuildTimings, EthPirError>;
+
+    /// Answer queries. The server never learns which address was asked for.
+    /// Batching amortizes the database pass; see Performance for the tradeoff.
+    pub fn respond(&self, query: &EthQuery) -> EthResponse;
+    pub fn respond_batch(&self, queries: &[EthQuery]) -> Vec<EthResponse>;
+
+    /// A cloneable, `Send` handle that serves while `&mut self` methods run.
+    pub fn responder(&self) -> EthPirResponder;
+
+    /// The keyword-helper wire service.
+    pub fn keyword(&self) -> KeywordWire<'_>;
+
+    pub fn len(&self) -> usize;             // addresses addressed: MPHF base + delta
+    pub fn is_empty(&self) -> bool;
+    pub fn pending(&self) -> usize;         // updates applied but not yet published
+    pub fn memory_report(&self) -> MemoryReport;
+}
+
+impl EthPirResponder {                      // + Clone
+    pub fn respond(&self, query: &EthQuery) -> EthResponse;
+    pub fn respond_batch(&self, queries: &[EthQuery]) -> Vec<EthResponse>;
+}
+
+// ---- Keyword helper (wire) ----------------------------------------------
+
+impl KeywordWire<'_> {
+    pub fn version(&self) -> u64;                    // MPHF generation
+    pub fn full(&self) -> Vec<u8>;                   // bootstrap / post-rebuild resync blob
+    pub fn mphf(&self) -> Vec<u8>;                   // MPHF parameters alone
+    pub fn tail(&self, have: usize) -> Vec<u8>;      // validated append-only tail
+}
+
+// ---- Client -------------------------------------------------------------
+
+impl EthPirClient {
+    /// Bootstrap from the server's full directory blob.
+    pub fn new(directory_blob: &[u8]) -> io::Result<Self>;
+    pub fn with_shape(config, layout, directory_blob) -> io::Result<Self>;
+
+    pub fn version(&self) -> u64;
+    pub fn tail_len(&self) -> usize;                         // pass to `KeywordWire::tail`
+    pub fn apply_tail(&mut self, tail: &[u8]) -> io::Result<()>;
+    pub fn resync(&mut self, directory_blob: &[u8]) -> io::Result<()>;
+
+    /// Build a private query for an address, and decrypt the answer. `decrypt`
+    /// checks the returned record actually carries the queried address, so a
+    /// stale mapping surfaces as `NotInSet` rather than a wrong balance.
+    pub fn query(&mut self, addr: Address) -> (EthQuery, LookupState);
+    pub fn decrypt(&mut self, response: &EthResponse, lookup: &LookupState)
+        -> Result<Balance, EthPirError>;
+}
+
+// ---- Reporting ----------------------------------------------------------
+
+pub struct InitTimings {    // keyword_index, records_scatter, server_alloc,
+    ...                     // database_encode, query_mask, offline, staging_alloc
+}
+pub struct RefreshTimings { // database_encode, precompute, install
+    ...
+}
+pub struct KeywordRebuildTimings {  // collect_keys, mphf_rebuild, permute,
+    ...                             // refresh: RefreshTimings
+}
+pub struct MemoryReport {   // serving_database, staging_database, precomputation,
+    ...                     // online_scratch_pool, records, keyword_directory
+}
+// each has `total()`; `MemoryReport` also has `refresh_peak()`
+```
 
 ## Repository Layout
 
@@ -174,5 +358,7 @@ remain as compatibility wrappers for `flush_records()` and
 - `src/server.rs`: `EthPirServer`, `EthPirResponder`, `KeywordWire`.
 - `src/client.rs`: `EthPirClient`, lookup state, decrypt verification.
 - `examples/eth_pir.rs`: 16 M initial-address demo on the 2 GiB shape, with 1 M
-  balance updates, 50 K inserted addresses, record flush, append-only delta
-  lookup, and keyword-helper compaction.
+  balance updates, 50 K inserted addresses, batched lookups, a database rebuild
+  under concurrent query load, append-only delta lookup, and a keyword-index
+  rebuild.
+- `examples/eth_trace.rs`: per-phase parallelism audit and batch sweep.

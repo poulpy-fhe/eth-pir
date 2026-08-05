@@ -47,13 +47,16 @@ impl EthPirClient {
         self.directory.version()
     }
 
-    /// Delta keys held; pass to `KeywordWire::delta_from`.
-    pub fn delta_len(&self) -> usize {
+    /// How much of the append-only tail this client already holds. Pass it to
+    /// [`KeywordWire::tail`](crate::KeywordWire::tail) to fetch only what is
+    /// missing.
+    pub fn tail_len(&self) -> usize {
         self.directory.delta_len()
     }
 
-    /// Apply a validated delta envelope produced by `KeywordWire::delta_from`.
-    pub fn apply_delta(&mut self, tail: &[u8]) -> IoResult<()> {
+    /// Apply a validated tail envelope produced by
+    /// [`KeywordWire::tail`](crate::KeywordWire::tail).
+    pub fn apply_tail(&mut self, tail: &[u8]) -> IoResult<()> {
         self.directory.apply_delta_envelope(&mut { tail })
     }
 

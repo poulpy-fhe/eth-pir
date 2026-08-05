@@ -49,30 +49,34 @@
 //!
 //! Always use `--release`: debug builds are dramatically slower. The demo
 //! starts with 16 M addresses in the fixed `InsPIRe2-g32-2GiB-c65536` shape,
-//! then queues 1 M balance updates and 50 K inserted addresses. Flush and
-//! keyword-helper compaction briefly holds two serving snapshots; expect peak
-//! RSS to be roughly double the previous 1 GiB run.
+//! then applies 1 M balance updates and 50 K inserted addresses. Both rebuilds
+//! refresh one long-lived server in place: the
+//! encoded database and its precomputation are double-buffered, but the
+//! server's one-time setup (CRS masks, online scratch pool) is not.
 //!
 //! What this exercises:
 //!
 //! - server initialization from deterministic `(address, balance)` data,
 //! - client bootstrap from the keyword helper's full directory blob,
 //! - a private lookup and address-in-record verification,
-//! - 1 M queued balance updates plus 50 K new-key insertions,
-//! - validated keyword delta sync before flush,
-//! - record flush against the current keyword helper,
-//! - append-only delta lookup before MPHF rebuild,
-//! - keyword-helper flush and client resync,
+//! - 1 M balance updates plus 50 K new-key insertions,
+//! - validated keyword delta sync before the rebuild,
+//! - database rebuild against the current keyword helper,
+//! - append-only delta lookup before the MPHF rebuild,
+//! - keyword-index rebuild and client resync,
 //! - peak RSS reporting from `/proc/self/status` on Linux.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use eth_pir::{Address, Balance, EthPirClient, EthPirError, EthPirServer};
+use eth_pir::{Address, Balance, EthPirClient, EthPirError, EthPirServer, default_shape};
 
 const INITIAL_ADDRESSES: u64 = 16_000_000;
 const UPDATED_ADDRESSES: u64 = 1_000_000;
 const NEW_ADDRESSES: u64 = 50_000;
+const BATCHES: [usize; 2] = [32, 64];
 
 fn main() {
     // - Step 0: normalize the BLAS runtime before any PIR work starts.
@@ -114,7 +118,7 @@ fn main() {
         t.elapsed()
     );
 
-    // - Step 2: initialize the server snapshot.
+    // - Step 2: initialize the server.
     // - Build the keyword MPHF.
     // - Place each 64-byte record at its private-index slot.
     // - Encode the PIR database, generate the query mask, and run
@@ -122,12 +126,23 @@ fn main() {
     // - After this point the server can answer index PIR queries, while clients
     //   can map ETH addresses to PIR indices through the keyword helper.
     let t = Instant::now();
-    let mut server = EthPirServer::init(&map).expect("init");
+    let (mut server, init) = {
+        let (config, layout) = default_shape();
+        EthPirServer::init_with_timed(config, layout, &map).expect("init")
+    };
     // - Release the input map after the server copies records into its own
     //   storage, keeping peak memory closer to a production loader after it
-    //   publishes a serving snapshot.
+    //   publishes its first database.
     drop(map);
     println!("SERVER init (MPHF+fill+offline)  : {:?}", t.elapsed());
+    let peak_after_init = peak_rss_bytes();
+    println!("  keyword index (MPHF build)     : {:?}", init.keyword_index);
+    println!("  records alloc + scatter        : {:?}", init.records_scatter);
+    println!("  server alloc (DB + NUMA touch) : {:?}   [one-time]", init.server_alloc);
+    println!("  database encode                : {:?}", init.database_encode);
+    println!("  CRS query masks                : {:?}   [one-time]", init.query_mask);
+    println!("  offline (precomp + pool warm)  : {:?}   [pool warm is one-time]", init.offline);
+    println!("  staging database alloc         : {:?}   [one-time]", init.staging_alloc);
 
     // - Step 3: bootstrap the client from the keyword helper.
     // - Download the full serialized directory: MPHF parameters, capacity,
@@ -155,32 +170,78 @@ fn main() {
     let sample_existing = address_at(UPDATED_ADDRESSES - 1);
     let t = Instant::now();
     let balance = lookup(&server, &mut client, sample_existing).expect("address is in the set");
-    println!("lookup (1 query round trip)      : {:?}", t.elapsed());
+    let balance_lookup = t.elapsed();
+    println!("lookup (1 query round trip)      : {balance_lookup:?}");
     assert_eq!(balance, balance_of(&sample_existing));
     println!("  balance                        : {}", u256_hex(&balance));
 
-    // - Step 5: queue many existing-address updates and many insertions.
+    // - Step 4b: answer a batch of independent lookups in one call.
+    // - `respond_batch` streams the plaintext database once for the whole batch
+    //   instead of once per query, and runs the per-query FHE tail across the
+    //   worker pool.
+    // - Addresses are spread across the key space so the batch cannot benefit
+    //   from locality a real workload would not have.
+    // - The client still builds one private query per address and verifies each
+    //   returned record independently; batching is a server-side optimization
+    //   with no effect on what a client sees.
+    let single_rate = 1.0 / balance_lookup.as_secs_f64();
+    for batch in BATCHES {
+        let batch_addresses: Vec<Address> = (0..batch)
+            .map(|k| address_at(k as u64 * (INITIAL_ADDRESSES / batch as u64)))
+            .collect();
+        let t = Instant::now();
+        let mut queries = Vec::with_capacity(batch);
+        let mut states = Vec::with_capacity(batch);
+        for addr in &batch_addresses {
+            let (query, state) = client.query(*addr);
+            queries.push(query);
+            states.push(state);
+        }
+        let batch_build = t.elapsed();
+
+        let t = Instant::now();
+        let responses = server.respond_batch(&queries);
+        let batch_wall = t.elapsed();
+
+        for ((response, state), addr) in responses.iter().zip(&states).zip(&batch_addresses) {
+            let value = client.decrypt(response, state).expect("address is in the set");
+            assert_eq!(value, balance_of(addr));
+        }
+        let rate = batch as f64 / batch_wall.as_secs_f64();
+        println!("lookup batch of {batch:<3}            : {batch_wall:?}  (all {batch} records verify)");
+        println!(
+            "  per query (amortized)          : {:?}",
+            batch_wall / batch as u32
+        );
+        println!(
+            "  throughput                     : {rate:.1} queries/s   ({:.1}x the single-query rate)",
+            rate / single_rate
+        );
+        println!("  client-side build of {batch:<3} queries : {batch_build:?}");
+    }
+
+    // - Step 5: apply many existing-address updates and many insertions.
     // - Update the first 1M existing token balances.
     // - Append 50K new addresses to the keyword delta overlay.
-    // - Leave the serving PIR snapshot unchanged for now.
-    // - Queueing lets production services absorb writes without rebuilding the
-    //   expensive offline snapshot on every update.
+    // - Leave the served database unchanged for now.
+    // - Writes land in plaintext immediately, so a production service absorbs
+    //   them without rerunning the expensive precomputation on every update.
     let sample_new = address_at(INITIAL_ADDRESSES);
     let t = Instant::now();
     for i in 0..UPDATED_ADDRESSES {
         let addr = address_at(i);
         server
-            .queue_new_update(addr, updated_balance_of(&addr))
-            .expect("queue existing-address update");
+            .update(addr, updated_balance_of(&addr))
+            .expect("existing-address update");
     }
     for i in 0..NEW_ADDRESSES {
         let addr = address_at(INITIAL_ADDRESSES + i);
         server
-            .queue_new_update(addr, balance_of(&addr))
-            .expect("queue new-address insert");
+            .update(addr, balance_of(&addr))
+            .expect("new-address insert");
     }
     println!(
-        "QUEUE ({UPDATED_ADDRESSES} updates + {NEW_ADDRESSES} inserts): {:?}",
+        "UPDATE ({UPDATED_ADDRESSES} updates + {NEW_ADDRESSES} inserts): {:?}",
         t.elapsed()
     );
 
@@ -188,11 +249,13 @@ fn main() {
     // - Fetch the suffix of keyword entries the client has not seen yet.
     // - Validate the delta envelope before applying it.
     // - New address-to-index mappings are now known to the client, but their
-    //   record bodies are still zero until the server flushes queued updates.
+    //   record bodies are still zero until the server rebuilds the database.
     // - The assertions show that old data remains served for updated addresses
     //   and inserted addresses are not retrievable yet.
-    let tail = server.keyword().delta_from(client.delta_len());
-    client.apply_delta(&tail).expect("delta sync");
+    let tail = server.keyword().tail(client.tail_len());
+    let delta_wire_bytes = tail.len();
+    let directory_before_compaction = server.keyword().full().len();
+    client.apply_tail(&tail).expect("tail sync");
     assert_eq!(
         lookup(&server, &mut client, sample_existing),
         Ok(balance_of(&sample_existing))
@@ -206,24 +269,70 @@ fn main() {
         server.pending()
     );
 
-    // - Step 7: flush queued records into a new serving snapshot.
-    // - Apply pending balances to plaintext records.
+    // - Step 7: publish the pending updates.
     // - Rebuild the PIR database from the current keyword helper: base MPHF plus
     //   append-only delta.
-    // - Rerun offline preprocessing and atomically swap the responder snapshot.
+    // - Rerun the precomputation and swap it in with its database, as a pair.
     // - Do not rebuild the MPHF.
     // - Queued writes are not visible to PIR responses until the
     //   encrypted/preprocessed database has been rebuilt.
     // - After the swap, clients can retrieve updated records; inserted records
     //   are exercised in the next step through the append-only delta path.
+    // - Serve a continuous query load from another thread across the whole
+    //   rebuild, to show it does not take the server offline.
+    // - Every response must decode to either the pre-swap or the post-swap
+    //   balance: the database and its precomputation are swapped as a pair, so
+    //   no query can ever observe one without the other.
+    let responder = server.responder();
+    let stop = Arc::new(AtomicBool::new(false));
+    let load = {
+        let stop = stop.clone();
+        let blob = blob.clone();
+        std::thread::spawn(move || {
+            let mut client = EthPirClient::new(&blob).expect("load-generator client");
+            let (mut served, mut before, mut after) = (0u64, 0u64, 0u64);
+            let mut worst = std::time::Duration::ZERO;
+            while !stop.load(Ordering::Relaxed) {
+                let t = Instant::now();
+                let (query, state) = client.query(sample_existing);
+                let response = responder.respond(&query);
+                let balance = client.decrypt(&response, &state).expect("in set");
+                worst = worst.max(t.elapsed());
+                served += 1;
+                if balance == balance_of(&sample_existing) {
+                    before += 1;
+                } else if balance == updated_balance_of(&sample_existing) {
+                    after += 1;
+                } else {
+                    panic!("torn read: response matched neither the old nor the new balance");
+                }
+            }
+            (served, before, after, worst)
+        })
+    };
+
     let t = Instant::now();
-    server.flush_records();
-    println!("FLUSH RECORDS (DB+offline)       : {:?}", t.elapsed());
+    let refresh = server.rebuild_database().expect("updates were pending");
+    let rebuild_wall = t.elapsed();
+    stop.store(true, Ordering::Relaxed);
+    let (served, before, after, worst) = load.join().expect("load generator");
+    println!("REBUILD DATABASE                 : {rebuild_wall:?}");
+    println!("  database encode from records   : {:?}", refresh.database_encode);
+    println!("  precompute (no server lock)    : {:?}", refresh.precompute);
+    println!("  install + free old precomp     : {:?}", refresh.install);
+    println!(
+        "  served concurrently            : {served} queries ({before} pre-swap, {after} post-swap), worst {worst:?}"
+    );
+    assert!(
+        before > 0 && after > 0,
+        "the load generator should straddle the swap"
+    );
     assert_eq!(
         lookup(&server, &mut client, sample_existing),
         Ok(updated_balance_of(&sample_existing))
     );
-    println!("  post-flush: sample update verifies");
+    println!("  post-rebuild: sample update verifies");
+    let peak_after_rebuild = peak_rss_bytes();
 
     // - Step 8: query an appended address before rebuilding the MPHF.
     // - Keep both server and client on directory version 0.
@@ -231,7 +340,7 @@ fn main() {
     //   address to its post-MPHF index.
     // - Demonstrate the intended steady-state path between MPHF rebuilds:
     //   clients fetch small delta tails for new addresses and can query those
-    //   addresses after the server flushes the matching records.
+    //   addresses after the server rebuilds the database.
     assert_eq!(server.keyword().version(), 0);
     assert_eq!(client.version(), 0);
     let t = Instant::now();
@@ -241,31 +350,24 @@ fn main() {
     assert_eq!(inserted_balance, balance_of(&sample_new));
     println!("  append-only delta lookup verifies");
 
-    // - Step 9: prepare a keyword-helper flush.
-    // - Construct a fresh MPHF over the complete key set.
-    // - Permute records into the new MPHF order.
-    // - Keep the live keyword directory and serving snapshot unchanged.
-    // - Compacting the delta overlay back into the MPHF keeps lookup state small
-    //   and lookup behavior predictable.
+    // - Step 9: compact the delta back into a fresh MPHF.
+    // - Construct a fresh MPHF over the complete key set, permute records into
+    //   its order, then rebuild the database so the served layout matches.
+    // - The new directory version is published only once that database is live,
+    //   because clients query by index and every index moves.
+    // - Compacting keeps client lookup state small and lookup behavior
+    //   predictable.
     let t = Instant::now();
-    let prepared = server
-        .prepare_keyword_helper_flush()
-        .expect("prepare keyword-helper flush");
-    println!("PREPARE KEYWORD (MPHF+permute)   : {:?}", t.elapsed());
-    assert_eq!(server.keyword().version(), 0);
-
-    // - Step 10: publish the keyword-helper flush.
-    // - Re-encode the database in the prepared MPHF order.
-    // - Rerun offline preprocessing and atomically swap the responder snapshot.
-    // - Publish the directory version only after the PIR snapshot matches it.
-    // - This phase is required for correctness: clients query PIR by index, so
-    //   a new MPHF cannot be exposed while the server still serves the old
-    //   physical layout.
-    let t = Instant::now();
-    server
-        .publish_keyword_helper_flush(prepared)
-        .expect("publish keyword-helper flush");
-    println!("FLUSH KEYWORD (DB+offline)       : {:?}", t.elapsed());
+    let rebuild = server
+        .rebuild_keyword_index()
+        .expect("keyword index rebuild");
+    println!("REBUILD KEYWORD INDEX            : {:?}", t.elapsed());
+    println!("  collect keys from records      : {:?}", rebuild.collect_keys);
+    println!("  MPHF rebuild                   : {:?}", rebuild.mphf_rebuild);
+    println!("  permute records to new order   : {:?}", rebuild.permute);
+    println!("  database encode from records   : {:?}", rebuild.refresh.database_encode);
+    println!("  precompute (no server lock)    : {:?}", rebuild.refresh.precompute);
+    println!("  install + free old precomp     : {:?}", rebuild.refresh.install);
     assert_eq!(server.keyword().version(), 1);
 
     // - Step 11: resynchronize the client after an MPHF rebuild.
@@ -285,18 +387,95 @@ fn main() {
         Ok(balance_of(&sample_new))
     );
     println!("  post-rebuild: sample lookups verify");
+    let peak_after_keyword = peak_rss_bytes();
 
-    // - Step 12: report peak resident memory when running on Linux.
-    // - Read `/proc/self/status` and print VmHWM if available.
-    // - This example intentionally exercises a large real-shape database.
-    // - Peak memory is one of the first production capacity signals to check
-    //   when changing backend, BLAS, NUMA, or snapshotting behavior.
+    // - Step 12: report the wire sizes the deployment actually pays for.
+    // - The MPHF blob is the one-time client bootstrap; the delta is what an
+    //   incremental sync costs instead, as a naive list of 20-byte addresses.
+    // - Their ratio is what decides how long the append-only path stays
+    //   cheaper than re-downloading a rebuilt MPHF.
+    let (config, layout) = default_shape();
+    let mphf_bytes = server.keyword().mphf().len();
+    let full_bytes = server.keyword().full().len();
+    let query_bytes = config.query_size(layout).total_size();
+    let response_bytes = config.response_size(layout).total_size();
+    println!();
+    println!("WIRE SIZES");
+    println!("  client query                     : {:>12}", bytes(query_bytes));
+    println!("  server response                  : {:>12}", bytes(response_bytes));
+    println!(
+        "  keyword MPHF (client bootstrap)  : {:>12}   {:.3} bits/key over {} keys",
+        bytes(mphf_bytes),
+        mphf_bytes as f64 * 8.0 / server.len() as f64,
+        server.len()
+    );
+    println!(
+        "  keyword delta, {NEW_ADDRESSES} inserts     : {:>12}   naive 20 B/key list + 48 B envelope",
+        bytes(delta_wire_bytes)
+    );
+    println!(
+        "  full directory before compaction : {:>12}   MPHF + that delta overlay",
+        bytes(directory_before_compaction)
+    );
+    println!(
+        "  full directory after compaction  : {:>12}   delta folded back into the MPHF",
+        bytes(full_bytes)
+    );
+    println!(
+        "  -> a delta stays cheaper than refetching the MPHF for ~{} inserts",
+        mphf_bytes / 20
+    );
+
+    // - Step 13: account for the memory the server holds.
+    // - `MemoryReport` names the allocations that scale; VmHWM is what the
+    //   kernel actually saw.
+    // - The gap between `refresh_peak` and VmHWM is the transient working set
+    //   of the precomputation plus the example's own 16 M-address fixtures.
+    let mem = server.memory_report();
+    println!();
+    println!("MEMORY BREAKDOWN");
+    println!("  online scratch pool              : {:>12}   one-time, sized by PIR_THREADS, not by the DB", bytes(mem.online_scratch_pool));
+    println!("  serving database                 : {:>12}", bytes(mem.serving_database));
+    println!("  staging database                 : {:>12}   the retired buffer, refilled next refresh", bytes(mem.staging_database));
+    println!("  precomputation (mask side)       : {:>12}   counted buffers only, see note", bytes(mem.precomputation));
+    println!("  plaintext records                : {:>12}", bytes(mem.records));
+    println!("  keyword directory (approx)       : {:>12}", bytes(mem.keyword_directory));
+    println!("  --------------------------------------------------");
+    println!("  accounted steady state           : {:>12}", bytes(mem.total()));
+    println!(
+        "  + second precomp during refresh  : {:>12}   between precompute and install",
+        bytes(mem.precomputation)
+    );
+    println!("  = expected refresh peak          : {:>12}", bytes(mem.refresh_peak()));
     if let Some(peak) = peak_rss_bytes() {
+        let peak = peak as usize;
+        println!("  measured peak (VmHWM)            : {:>12}", bytes(peak));
         println!(
-            "PEAK MEMORY (VmHWM)              : {:.3} GiB",
-            peak as f64 / (1u64 << 30) as f64
+            "  unaccounted                      : {:>12}",
+            bytes(peak.saturating_sub(mem.refresh_peak()))
         );
     }
+
+    // - Which phase actually set the high-water mark. VmHWM only ever rises, so
+    //   a phase that does not move it added nothing to the peak.
+    println!();
+    println!("  high-water mark after each phase:");
+    for (label, value) in [
+        ("init", peak_after_init),
+        ("database rebuild", peak_after_rebuild),
+        ("keyword compaction", peak_after_keyword),
+    ] {
+        if let Some(v) = value {
+            println!("    {label:<28} : {:>12}", bytes(v as usize));
+        }
+    }
+    println!();
+    println!("  The unaccounted remainder is transient. Candidates, largest first:");
+    println!("  the scratch each offline worker allocates for its own parallel region,");
+    println!("  the precomputation's BSGS giant-step FFT plans (type-erased, so the");
+    println!("  report cannot size them), and this example's own {INITIAL_ADDRESSES}-entry");
+    println!("  input HashMap, freed right after init but counted in the high-water mark.");
+    println!();
     println!("RESULT                           : OK");
 }
 
@@ -369,6 +548,22 @@ fn splitmix64(z: u64) -> u64 {
 fn u256_hex(le: &Balance) -> String {
     let be: String = le.iter().rev().map(|b| format!("{b:02x}")).collect();
     format!("0x{be}")
+}
+
+// - Format a byte count in the largest unit that keeps it readable.
+fn bytes(n: usize) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{value:.3} {}", UNITS[unit])
+    }
 }
 
 // - Return Linux's peak resident set size counter, if this platform exposes it.
