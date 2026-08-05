@@ -6,8 +6,9 @@ This crate depends on `poulpy-pir` crate and packages its
 index-based PIR core plus keyword directory into a fixed-shape service:
 
 - construction: InsPIRe2 recursion,
-- default backend feature: `avx2-fhe` using `FFT64Avx` (AVX2/FMA),
-- optional backend feature: `avx512-fhe` using `FFT64Avx512`,
+- default backend: portable `FFT64Ref` for checks, docs, and downstream builds,
+- production backend feature: `avx2-fhe` using `FFT64Avx` (AVX2/FMA),
+- optional production backend feature: `avx512-fhe` using `FFT64Avx512`,
 - optional GEMM feature: `cblas-gemm` for system CBLAS/OpenBLAS offline
   preprocessing,
 - optional NUMA feature: `numa-db-interleave` forwards to `poulpy-pir` database
@@ -20,20 +21,19 @@ index-based PIR core plus keyword directory into a fixed-shape service:
 
 ## Run
 
-The default `avx2-fhe` feature uses `FFT64Avx` (AVX2/FMA). This repository
-includes a local `.cargo/config.toml` that passes the required `+avx2,+fma`
-target features on x86/x86_64, so the short command works from this repository
-root:
+Default builds use the portable reference backend so the crate compiles
+without CPU-specific flags. That path is for checks and documentation, not the
+2 GiB production demo:
 
 ```sh
-cargo run --release --example eth_pir
+cargo test --release --lib
 ```
 
-The equivalent explicit command is:
+Production AVX2/FMA runs use the explicit backend feature and target flags:
 
 ```sh
 RUSTFLAGS="-C target-feature=+avx2,+fma" \
-cargo run --release --example eth_pir
+cargo run --release --features avx2-fhe --example eth_pir
 ```
 
 On an AVX-512F host:
@@ -67,7 +67,7 @@ physical core; see [Performance](#performance) for why SMT is not worth it here.
 `PIR_THREADS` overrides it in either direction and is not capped:
 
 ```sh
-PIR_THREADS=32 cargo run --release --example eth_pir
+PIR_THREADS=32 RUSTFLAGS="-C target-feature=+avx2,+fma" cargo run --release --features avx2-fhe --example eth_pir
 ```
 
 It sizes both `poulpy-pir`'s internal parallelism and `eth-pir`'s own bulk record
@@ -254,7 +254,10 @@ pub fn default_shape() -> (Config<U512P65536>, DatabaseLayout<U512P65536>);
 
 pub enum EthPirError {
     NotInSet,                    // the record returned does not carry the queried address
+    ServerPoisoned,
     Keyword(KeywordError<20>),
+    Pir(poulpy_pir::PirError),
+    Io { kind: io::ErrorKind, message: String },
 }
 
 // ---- Server -------------------------------------------------------------
@@ -277,6 +280,7 @@ impl EthPirServer {
     /// current MPHF, so no client resync is needed. Queries are served
     /// throughout. `None` if nothing was pending.
     pub fn rebuild_database(&mut self) -> Option<RefreshTimings>;
+    pub fn try_rebuild_database(&mut self) -> Result<Option<RefreshTimings>, EthPirError>;
 
     /// Compact the append-only delta into a fresh MPHF, permute the records, and
     /// rebuild the database to match, publishing the new directory version last.
@@ -286,7 +290,9 @@ impl EthPirServer {
     /// Answer queries. The server never learns which address was asked for.
     /// Batching amortizes the database pass; see Performance for the tradeoff.
     pub fn respond(&self, query: &EthQuery) -> EthResponse;
+    pub fn try_respond(&self, query: &EthQuery) -> Result<EthResponse, EthPirError>;
     pub fn respond_batch(&self, queries: &[EthQuery]) -> Vec<EthResponse>;
+    pub fn try_respond_batch(&self, queries: &[EthQuery]) -> Result<Vec<EthResponse>, EthPirError>;
 
     /// A cloneable, `Send` handle that serves while `&mut self` methods run.
     pub fn responder(&self) -> EthPirResponder;
@@ -302,7 +308,9 @@ impl EthPirServer {
 
 impl EthPirResponder {                      // + Clone
     pub fn respond(&self, query: &EthQuery) -> EthResponse;
+    pub fn try_respond(&self, query: &EthQuery) -> Result<EthResponse, EthPirError>;
     pub fn respond_batch(&self, queries: &[EthQuery]) -> Vec<EthResponse>;
+    pub fn try_respond_batch(&self, queries: &[EthQuery]) -> Result<Vec<EthResponse>, EthPirError>;
 }
 
 // ---- Keyword helper (wire) ----------------------------------------------
@@ -310,8 +318,11 @@ impl EthPirResponder {                      // + Clone
 impl KeywordWire<'_> {
     pub fn version(&self) -> u64;                    // MPHF generation
     pub fn full(&self) -> Vec<u8>;                   // bootstrap / post-rebuild resync blob
+    pub fn try_full(&self) -> io::Result<Vec<u8>>;
     pub fn mphf(&self) -> Vec<u8>;                   // MPHF parameters alone
+    pub fn try_mphf(&self) -> io::Result<Vec<u8>>;
     pub fn tail(&self, have: usize) -> Vec<u8>;      // validated append-only tail
+    pub fn try_tail(&self, have: usize) -> io::Result<Vec<u8>>;
 }
 
 // ---- Client -------------------------------------------------------------
@@ -319,18 +330,25 @@ impl KeywordWire<'_> {
 impl EthPirClient {
     /// Bootstrap from the server's full directory blob.
     pub fn new(directory_blob: &[u8]) -> io::Result<Self>;
+    pub fn try_new(directory_blob: &[u8]) -> Result<Self, EthPirError>;
     pub fn with_shape(config, layout, directory_blob) -> io::Result<Self>;
+    pub fn try_with_shape(config, layout, directory_blob) -> Result<Self, EthPirError>;
 
     pub fn version(&self) -> u64;
     pub fn tail_len(&self) -> usize;                         // pass to `KeywordWire::tail`
     pub fn apply_tail(&mut self, tail: &[u8]) -> io::Result<()>;
+    pub fn try_apply_tail(&mut self, tail: &[u8]) -> Result<(), EthPirError>;
     pub fn resync(&mut self, directory_blob: &[u8]) -> io::Result<()>;
+    pub fn try_resync(&mut self, directory_blob: &[u8]) -> Result<(), EthPirError>;
 
     /// Build a private query for an address, and decrypt the answer. `decrypt`
     /// checks the returned record actually carries the queried address, so a
     /// stale mapping surfaces as `NotInSet` rather than a wrong balance.
     pub fn query(&mut self, addr: Address) -> (EthQuery, LookupState);
+    pub fn try_query(&mut self, addr: Address) -> Result<(EthQuery, LookupState), EthPirError>;
     pub fn decrypt(&mut self, response: &EthResponse, lookup: &LookupState)
+        -> Result<Balance, EthPirError>;
+    pub fn try_decrypt(&mut self, response: &EthResponse, lookup: &LookupState)
         -> Result<Balance, EthPirError>;
 }
 

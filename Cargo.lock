@@ -512,6 +512,7 @@ version = "0.1.0"
 dependencies = [
  "poulpy-cpu-avx",
  "poulpy-cpu-avx512",
+ "poulpy-cpu-ref",
  "poulpy-pir",
 ]
 
@@ -679,15 +680,6 @@ name = "itertools"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
 dependencies = [
  "either",
 ]
@@ -992,14 +984,15 @@ dependencies = [
 
 [[package]]
 name = "poulpy-core"
-version = "0.6.0"
-source = "git+https://github.com/poulpy-fhe/poulpy?rev=f1dc3d4e04394ce9cba2aa396cc0fe19be4645ed#f1dc3d4e04394ce9cba2aa396cc0fe19be4645ed"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3581dae00876661b15e8cc6ad67397b93991393d0657093017ba86745da78e8"
 dependencies = [
  "anyhow",
  "bytemuck",
  "byteorder",
  "dashu-float",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "num-traits",
  "once_cell",
  "paste",
@@ -1010,12 +1003,13 @@ dependencies = [
 
 [[package]]
 name = "poulpy-cpu-avx"
-version = "0.6.0"
-source = "git+https://github.com/poulpy-fhe/poulpy?rev=f1dc3d4e04394ce9cba2aa396cc0fe19be4645ed#f1dc3d4e04394ce9cba2aa396cc0fe19be4645ed"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fdbb082fcd905ec49bcceeba9e3385140997b328c4caba9fe9c853f252852c9"
 dependencies = [
  "bytemuck",
  "byteorder",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "once_cell",
  "paste",
  "poulpy-core",
@@ -1029,12 +1023,13 @@ dependencies = [
 
 [[package]]
 name = "poulpy-cpu-avx512"
-version = "0.6.0"
-source = "git+https://github.com/poulpy-fhe/poulpy?rev=f1dc3d4e04394ce9cba2aa396cc0fe19be4645ed#f1dc3d4e04394ce9cba2aa396cc0fe19be4645ed"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b0d6a4ecf0652c48fe0326e07a985f241a349cabb09571bf6d92d196c041cac"
 dependencies = [
  "bytemuck",
  "byteorder",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "once_cell",
  "paste",
  "poulpy-core",
@@ -1048,14 +1043,15 @@ dependencies = [
 
 [[package]]
 name = "poulpy-cpu-ref"
-version = "0.6.0"
-source = "git+https://github.com/poulpy-fhe/poulpy?rev=f1dc3d4e04394ce9cba2aa396cc0fe19be4645ed#f1dc3d4e04394ce9cba2aa396cc0fe19be4645ed"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b79e8c51c66a2b56004a552fd6b41739528da90e1b3e0be56f5f618a5e098326"
 dependencies = [
  "anyhow",
  "bytemuck",
  "byteorder",
  "dashu-float",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "once_cell",
  "poulpy-core",
  "poulpy-hal",
@@ -1067,15 +1063,16 @@ dependencies = [
 
 [[package]]
 name = "poulpy-hal"
-version = "0.6.0"
-source = "git+https://github.com/poulpy-fhe/poulpy?rev=f1dc3d4e04394ce9cba2aa396cc0fe19be4645ed#f1dc3d4e04394ce9cba2aa396cc0fe19be4645ed"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd1b50b02be33fe2132930d86c2c960a8c450112016b9ace552ac4da3c3e3789"
 dependencies = [
  "anyhow",
  "bytemuck",
  "byteorder",
  "cmake",
  "dashu-float",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "libc",
  "once_cell",
  "paste",
@@ -1088,7 +1085,6 @@ dependencies = [
 [[package]]
 name = "poulpy-pir"
 version = "0.1.0"
-source = "git+https://github.com/poulpy-fhe/poulpy-pir?rev=06ffe1efe32b04e763a35701706a833f2d050248#06ffe1efe32b04e763a35701706a833f2d050248"
 dependencies = [
  "epserde 0.13.1",
  "getrandom",

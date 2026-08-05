@@ -19,3 +19,21 @@ fn default_shape_has_expected_capacity() {
     let (config, layout) = default_shape();
     assert_eq!(layout.num_payloads(config.column_height()), 33_554_432);
 }
+
+#[test]
+fn client_bootstrap_rejects_invalid_directory_blob() {
+    let err = match EthPirClient::try_new(b"not a keyword directory") {
+        Ok(_) => panic!("invalid keyword directory was accepted"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, EthPirError::Io { .. }));
+}
+
+#[test]
+fn io_error_mapping_preserves_truncated_wire_kind() {
+    let err = match EthPirClient::new(b"not a keyword directory") {
+        Ok(_) => panic!("invalid keyword directory was accepted"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+}

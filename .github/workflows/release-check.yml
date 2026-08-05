@@ -1,0 +1,17 @@
+name: Release Check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  release-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --release --lib
+      - run: RUSTFLAGS="-C target-feature=+avx2,+fma" cargo test --release --lib --features avx2-fhe
+      - run: cargo doc --no-deps
+      - run: cargo package --allow-dirty

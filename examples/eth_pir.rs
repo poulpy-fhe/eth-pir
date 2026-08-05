@@ -3,16 +3,14 @@
 //! Run from the `eth-pir` repository root:
 //!
 //! ```sh
-//! cargo run --release --example eth_pir
+//! cargo test --release --lib
 //! ```
 //!
-//! The default `avx2-fhe` feature uses `FFT64Avx` (AVX2/FMA). This repository
-//! includes a local `.cargo/config.toml` that sets `-C target-feature=+avx2,+fma`
-//! for x86/x86_64 builds. The equivalent explicit command is:
+//! The full 2 GiB demo is a production AVX workload. Build it explicitly:
 //!
 //! ```sh
 //! RUSTFLAGS="-C target-feature=+avx2,+fma" \
-//! cargo run --release --example eth_pir
+//! cargo run --release --features avx2-fhe --example eth_pir
 //! ```
 //!
 //! On an AVX-512F host, switch to `FFT64Avx512` with:
@@ -136,13 +134,34 @@ fn main() {
     drop(map);
     println!("SERVER init (MPHF+fill+offline)  : {:?}", t.elapsed());
     let peak_after_init = peak_rss_bytes();
-    println!("  keyword index (MPHF build)     : {:?}", init.keyword_index);
-    println!("  records alloc + scatter        : {:?}", init.records_scatter);
-    println!("  server alloc (DB + NUMA touch) : {:?}   [one-time]", init.server_alloc);
-    println!("  database encode                : {:?}", init.database_encode);
-    println!("  CRS query masks                : {:?}   [one-time]", init.query_mask);
-    println!("  offline (precomp + pool warm)  : {:?}   [pool warm is one-time]", init.offline);
-    println!("  staging database alloc         : {:?}   [one-time]", init.staging_alloc);
+    println!(
+        "  keyword index (MPHF build)     : {:?}",
+        init.keyword_index
+    );
+    println!(
+        "  records alloc + scatter        : {:?}",
+        init.records_scatter
+    );
+    println!(
+        "  server alloc (DB + NUMA touch) : {:?}   [one-time]",
+        init.server_alloc
+    );
+    println!(
+        "  database encode                : {:?}",
+        init.database_encode
+    );
+    println!(
+        "  CRS query masks                : {:?}   [one-time]",
+        init.query_mask
+    );
+    println!(
+        "  offline (precomp + pool warm)  : {:?}   [pool warm is one-time]",
+        init.offline
+    );
+    println!(
+        "  staging database alloc         : {:?}   [one-time]",
+        init.staging_alloc
+    );
 
     // - Step 3: bootstrap the client from the keyword helper.
     // - Download the full serialized directory: MPHF parameters, capacity,
@@ -204,11 +223,15 @@ fn main() {
         let batch_wall = t.elapsed();
 
         for ((response, state), addr) in responses.iter().zip(&states).zip(&batch_addresses) {
-            let value = client.decrypt(response, state).expect("address is in the set");
+            let value = client
+                .decrypt(response, state)
+                .expect("address is in the set");
             assert_eq!(value, balance_of(addr));
         }
         let rate = batch as f64 / batch_wall.as_secs_f64();
-        println!("lookup batch of {batch:<3}            : {batch_wall:?}  (all {batch} records verify)");
+        println!(
+            "lookup batch of {batch:<3}            : {batch_wall:?}  (all {batch} records verify)"
+        );
         println!(
             "  per query (amortized)          : {:?}",
             batch_wall / batch as u32
@@ -317,8 +340,14 @@ fn main() {
     stop.store(true, Ordering::Relaxed);
     let (served, before, after, worst) = load.join().expect("load generator");
     println!("REBUILD DATABASE                 : {rebuild_wall:?}");
-    println!("  database encode from records   : {:?}", refresh.database_encode);
-    println!("  precompute (no server lock)    : {:?}", refresh.precompute);
+    println!(
+        "  database encode from records   : {:?}",
+        refresh.database_encode
+    );
+    println!(
+        "  precompute (no server lock)    : {:?}",
+        refresh.precompute
+    );
     println!("  install + free old precomp     : {:?}", refresh.install);
     println!(
         "  served concurrently            : {served} queries ({before} pre-swap, {after} post-swap), worst {worst:?}"
@@ -362,12 +391,27 @@ fn main() {
         .rebuild_keyword_index()
         .expect("keyword index rebuild");
     println!("REBUILD KEYWORD INDEX            : {:?}", t.elapsed());
-    println!("  collect keys from records      : {:?}", rebuild.collect_keys);
-    println!("  MPHF rebuild                   : {:?}", rebuild.mphf_rebuild);
+    println!(
+        "  collect keys from records      : {:?}",
+        rebuild.collect_keys
+    );
+    println!(
+        "  MPHF rebuild                   : {:?}",
+        rebuild.mphf_rebuild
+    );
     println!("  permute records to new order   : {:?}", rebuild.permute);
-    println!("  database encode from records   : {:?}", rebuild.refresh.database_encode);
-    println!("  precompute (no server lock)    : {:?}", rebuild.refresh.precompute);
-    println!("  install + free old precomp     : {:?}", rebuild.refresh.install);
+    println!(
+        "  database encode from records   : {:?}",
+        rebuild.refresh.database_encode
+    );
+    println!(
+        "  precompute (no server lock)    : {:?}",
+        rebuild.refresh.precompute
+    );
+    println!(
+        "  install + free old precomp     : {:?}",
+        rebuild.refresh.install
+    );
     assert_eq!(server.keyword().version(), 1);
 
     // - Step 11: resynchronize the client after an MPHF rebuild.
@@ -401,8 +445,14 @@ fn main() {
     let response_bytes = config.response_size(layout).total_size();
     println!();
     println!("WIRE SIZES");
-    println!("  client query                     : {:>12}", bytes(query_bytes));
-    println!("  server response                  : {:>12}", bytes(response_bytes));
+    println!(
+        "  client query                     : {:>12}",
+        bytes(query_bytes)
+    );
+    println!(
+        "  server response                  : {:>12}",
+        bytes(response_bytes)
+    );
     println!(
         "  keyword MPHF (client bootstrap)  : {:>12}   {:.3} bits/key over {} keys",
         bytes(mphf_bytes),
@@ -434,19 +484,43 @@ fn main() {
     let mem = server.memory_report();
     println!();
     println!("MEMORY BREAKDOWN");
-    println!("  online scratch pool              : {:>12}   one-time, sized by PIR_THREADS, not by the DB", bytes(mem.online_scratch_pool));
-    println!("  serving database                 : {:>12}", bytes(mem.serving_database));
-    println!("  staging database                 : {:>12}   the retired buffer, refilled next refresh", bytes(mem.staging_database));
-    println!("  precomputation (mask side)       : {:>12}   counted buffers only, see note", bytes(mem.precomputation));
-    println!("  plaintext records                : {:>12}", bytes(mem.records));
-    println!("  keyword directory (approx)       : {:>12}", bytes(mem.keyword_directory));
+    println!(
+        "  online scratch pool              : {:>12}   one-time, sized by PIR_THREADS, not by the DB",
+        bytes(mem.online_scratch_pool)
+    );
+    println!(
+        "  serving database                 : {:>12}",
+        bytes(mem.serving_database)
+    );
+    println!(
+        "  staging database                 : {:>12}   the retired buffer, refilled next refresh",
+        bytes(mem.staging_database)
+    );
+    println!(
+        "  precomputation (mask side)       : {:>12}   counted buffers only, see note",
+        bytes(mem.precomputation)
+    );
+    println!(
+        "  plaintext records                : {:>12}",
+        bytes(mem.records)
+    );
+    println!(
+        "  keyword directory (approx)       : {:>12}",
+        bytes(mem.keyword_directory)
+    );
     println!("  --------------------------------------------------");
-    println!("  accounted steady state           : {:>12}", bytes(mem.total()));
+    println!(
+        "  accounted steady state           : {:>12}",
+        bytes(mem.total())
+    );
     println!(
         "  + second precomp during refresh  : {:>12}   between precompute and install",
         bytes(mem.precomputation)
     );
-    println!("  = expected refresh peak          : {:>12}", bytes(mem.refresh_peak()));
+    println!(
+        "  = expected refresh peak          : {:>12}",
+        bytes(mem.refresh_peak())
+    );
     if let Some(peak) = peak_rss_bytes() {
         let peak = peak as usize;
         println!("  measured peak (VmHWM)            : {:>12}", bytes(peak));

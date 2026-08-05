@@ -84,14 +84,14 @@ impl EthPirServer {
         // materialize the CRS query masks, and run a full `offline()` — the only
         // call that also warms the online scratch pool.
         let t = Instant::now();
-        let server = PirServer::new(config, layout);
+        let server = PirServer::try_new(config, layout)?;
         #[cfg(feature = "cblas-gemm")]
         let server = server.with_gemm(poulpy_pir::server::CblasDgemm);
         let mut server = server;
         timings.server_alloc = t.elapsed();
 
         let t = Instant::now();
-        server.update_shard(0, &records);
+        server.try_update_shard(0, &records)?;
         timings.database_encode = t.elapsed();
 
         let t = Instant::now();
@@ -127,7 +127,7 @@ impl EthPirServer {
     /// re-encodes and re-preprocesses the served database.
     pub fn update(&mut self, addr: Address, value: Balance) -> Result<(), EthPirError> {
         let i = self.directory.index(&addr);
-        if self.records[i][..20] == addr {
+        if i < self.records.len() && self.records[i][..20] == addr {
             self.records[i] = record_of(&addr, &value);
         } else {
             let appended = self.directory.push(&addr)?;
@@ -153,10 +153,16 @@ impl EthPirServer {
     ///
     /// Returns `None` when there was nothing pending.
     pub fn rebuild_database(&mut self) -> Option<RefreshTimings> {
+        self.try_rebuild_database()
+            .unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    /// Fallible variant of [`rebuild_database`](Self::rebuild_database).
+    pub fn try_rebuild_database(&mut self) -> Result<Option<RefreshTimings>, EthPirError> {
         if self.pending == 0 {
-            return None;
+            return Ok(None);
         }
-        Some(self.refresh())
+        Ok(Some(self.refresh()?))
     }
 
     /// Compact the append-only delta back into a fresh MPHF, then rebuild the
@@ -193,17 +199,29 @@ impl EthPirServer {
 
         self.directory = next;
         self.records = records;
-        timings.refresh = self.refresh();
+        timings.refresh = self.refresh()?;
         Ok(timings)
     }
 
     /// Answer one query against the current database.
     pub fn respond(&self, query: &EthQuery) -> EthResponse {
+        self.try_respond(query)
+            .unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    /// Fallible variant of [`respond`](Self::respond).
+    pub fn try_respond(&self, query: &EthQuery) -> Result<EthResponse, EthPirError> {
         respond_with(&self.serving, query)
     }
 
     /// Answer a batch against the current database.
     pub fn respond_batch(&self, queries: &[EthQuery]) -> Vec<EthResponse> {
+        self.try_respond_batch(queries)
+            .unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    /// Fallible variant of [`respond_batch`](Self::respond_batch).
+    pub fn try_respond_batch(&self, queries: &[EthQuery]) -> Result<Vec<EthResponse>, EthPirError> {
         respond_batch_with(&self.serving, queries)
     }
 
@@ -242,18 +260,18 @@ impl EthPirServer {
     ///
     /// Only the final `install` needs the server lock, and it is two moves — so
     /// the multi-second precomputation runs while queries are still answered.
-    fn refresh(&mut self) -> RefreshTimings {
+    fn refresh(&mut self) -> Result<RefreshTimings, EthPirError> {
         let mut timings = RefreshTimings::default();
 
         let t = Instant::now();
-        self.staging.encode_shard(0, &self.records);
+        self.staging.try_encode_shard(0, &self.records)?;
         timings.database_encode = t.elapsed();
 
         let t = Instant::now();
         let mut context = self
             .serving
             .lock()
-            .expect("serving server poisoned")
+            .map_err(|_| EthPirError::ServerPoisoned)?
             .precomp_context();
         let (precomputation, _) = context.offline_for(&mut self.staging);
         timings.precompute = t.elapsed();
@@ -264,12 +282,12 @@ impl EthPirServer {
         let t = Instant::now();
         self.serving
             .lock()
-            .expect("serving server poisoned")
+            .map_err(|_| EthPirError::ServerPoisoned)?
             .install(&mut self.staging, precomputation);
         timings.install = t.elapsed();
 
         self.pending = 0;
-        timings
+        Ok(timings)
     }
 
     /// Where this server's memory goes.
@@ -277,7 +295,8 @@ impl EthPirServer {
         let server = self
             .serving
             .lock()
-            .expect("serving server poisoned")
+            .map_err(|_| EthPirError::ServerPoisoned)
+            .unwrap_or_else(|err| panic!("{err}"))
             .memory_report();
         MemoryReport {
             serving_database: server.database,
@@ -306,26 +325,41 @@ impl Clone for EthPirResponder {
 
 impl EthPirResponder {
     pub fn respond(&self, query: &EthQuery) -> EthResponse {
+        self.try_respond(query)
+            .unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_respond(&self, query: &EthQuery) -> Result<EthResponse, EthPirError> {
         respond_with(&self.serving, query)
     }
 
     pub fn respond_batch(&self, queries: &[EthQuery]) -> Vec<EthResponse> {
+        self.try_respond_batch(queries)
+            .unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_respond_batch(&self, queries: &[EthQuery]) -> Result<Vec<EthResponse>, EthPirError> {
         respond_batch_with(&self.serving, queries)
     }
 }
 
-fn respond_with(serving: &Serving, query: &EthQuery) -> EthResponse {
+fn respond_with(serving: &Serving, query: &EthQuery) -> Result<EthResponse, EthPirError> {
     serving
         .lock()
-        .expect("serving server poisoned")
-        .respond(query)
+        .map_err(|_| EthPirError::ServerPoisoned)?
+        .try_respond(query)
+        .map_err(EthPirError::from)
 }
 
-fn respond_batch_with(serving: &Serving, queries: &[EthQuery]) -> Vec<EthResponse> {
+fn respond_batch_with(
+    serving: &Serving,
+    queries: &[EthQuery],
+) -> Result<Vec<EthResponse>, EthPirError> {
     serving
         .lock()
-        .expect("serving server poisoned")
-        .respond_batch(queries)
+        .map_err(|_| EthPirError::ServerPoisoned)?
+        .try_respond_batch(queries)
+        .map_err(EthPirError::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -494,29 +528,39 @@ impl KeywordWire<'_> {
 
     /// Full directory blob for bootstrap and post-rebuild resync.
     pub fn full(&self) -> Vec<u8> {
+        self.try_full().unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    /// Fallible full directory blob writer.
+    pub fn try_full(&self) -> std::io::Result<Vec<u8>> {
         let mut blob = Vec::new();
-        self.directory.write_to(&mut blob).expect("write to Vec");
-        blob
+        self.directory.write_to(&mut blob)?;
+        Ok(blob)
     }
 
     /// MPHF parameters alone.
     pub fn mphf(&self) -> Vec<u8> {
+        self.try_mphf().unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    /// Fallible MPHF-parameter writer.
+    pub fn try_mphf(&self) -> std::io::Result<Vec<u8>> {
         let mut blob = Vec::new();
-        self.directory
-            .mphf()
-            .write_to(&mut blob)
-            .expect("write to Vec");
-        blob
+        self.directory.mphf().write_to(&mut blob)?;
+        Ok(blob)
     }
 
     /// The validated append-only tail from position `have`: the delta keys a
     /// client at `have` has not seen yet, in a versioned envelope.
     pub fn tail(&self, have: usize) -> Vec<u8> {
+        self.try_tail(have).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    /// Fallible append-only tail writer.
+    pub fn try_tail(&self, have: usize) -> std::io::Result<Vec<u8>> {
         let mut tail = Vec::new();
-        self.directory
-            .write_delta_envelope_from(&mut tail, have)
-            .expect("write to Vec");
-        tail
+        self.directory.write_delta_envelope_from(&mut tail, have)?;
+        Ok(tail)
     }
 }
 

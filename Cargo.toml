@@ -2,15 +2,36 @@
 name = "eth-pir"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
+description = "Ethereum token-balance PIR service layer built on poulpy-pir"
+license = "Apache-2.0"
+repository = "https://github.com/poulpy-fhe/eth-pir"
+homepage = "https://github.com/poulpy-fhe/eth-pir"
+documentation = "https://docs.rs/eth-pir"
+readme = "README.md"
+keywords = ["pir", "fhe", "ethereum", "privacy"]
+categories = ["cryptography", "database"]
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "RELEASE.md",
+    "CONTRIBUTING.md",
+    "src/**",
+    "examples/**",
+]
 
 [dependencies]
-poulpy-pir = { git = "https://github.com/poulpy-fhe/poulpy-pir", rev = "06ffe1efe32b04e763a35701706a833f2d050248"}
-poulpy-cpu-avx = { git = "https://github.com/poulpy-fhe/poulpy", rev = "f1dc3d4e04394ce9cba2aa396cc0fe19be4645ed", features = ["enable-avx"], optional = true }
-poulpy-cpu-avx512 = { git = "https://github.com/poulpy-fhe/poulpy", rev = "f1dc3d4e04394ce9cba2aa396cc0fe19be4645ed", features = ["enable-avx512f"], optional = true }
+poulpy-pir = { version = "0.1.0", path = "../poulpy-pir" }
+poulpy-cpu-ref = { version = "0.7.0", features = ["enable-core"] }
+poulpy-cpu-avx = { version = "0.7.0", features = ["enable-avx"], optional = true }
+poulpy-cpu-avx512 = { version = "0.7.0", features = ["enable-avx512f"], optional = true }
 
 [features]
-default = ["avx2-fhe"]
-avx2-fhe = ["dep:poulpy-cpu-avx"]
+default = []
+avx2-fhe = ["dep:poulpy-cpu-avx", "poulpy-pir/avx2-fhe"]
 avx512-fhe = ["dep:poulpy-cpu-avx512"]
 cblas-gemm = ["poulpy-pir/cblas-gemm"]
 numa-db-interleave = ["poulpy-pir/numa-db-interleave"]
