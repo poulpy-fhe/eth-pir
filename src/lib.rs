@@ -10,6 +10,7 @@ mod client;
 mod server;
 
 pub use client::{EthPirClient, LookupState};
+
 pub use server::{
     EthPirResponder, EthPirServer, InitTimings, KeywordRebuildTimings, KeywordWire, MemoryReport,
     RefreshTimings,
@@ -37,8 +38,61 @@ pub type EthResponse = poulpy_pir::client::Response<DefaultBackend>;
 pub type Address = [u8; 20];
 /// A token balance: little-endian `u256` (byte 0 is least significant).
 pub type Balance = [u8; 32];
-/// One 64-byte payload: `[address || 0^12 || balance_le]`.
+/// One 64-byte payload: `[address || codec payload]`.
 pub(crate) type Record = [u8; 64];
+
+/// Bytes a record leaves to the application, after the address prefix.
+///
+/// The prefix is not a layout choice the application gets to make: it is what
+/// [`EthPirClient::try_decrypt`] compares against to prove the retrieved record
+/// really is the one queried. A minimal perfect hash maps an *unknown* key to
+/// some arbitrary occupied slot, so without that comparison a lookup for an
+/// address the server does not hold would return another address's value with
+/// no indication anything was wrong.
+pub const PAYLOAD_BYTES: usize = 64 - 20;
+
+/// How an application turns its value into the bytes of a record.
+///
+/// The PIR layer below is entirely opaque — `P65536<[u8; N]>` encodes a block as
+/// `N/2` little-endian 16-bit digits and never inspects it — so the record
+/// layout is eth-pir's to define, and this is where an application takes it
+/// over.
+///
+/// A codec never sees the address prefix. That keeps the not-in-set proof an
+/// invariant of the crate rather than a rule implementors have to remember: the
+/// worst a wrong codec can do is misread its own payload.
+pub trait RecordCodec: Send + Sync + 'static {
+    /// The value one record carries.
+    type Value: Copy + Send + Sync;
+    fn encode(value: &Self::Value) -> [u8; PAYLOAD_BYTES];
+    fn decode(bytes: &[u8; PAYLOAD_BYTES]) -> Self::Value;
+}
+
+/// The original layout: a single little-endian `u256` balance.
+///
+/// Placed at payload offset 12 — record offset 32 — so records are byte-for-byte
+/// identical to those written before the codec existed. Only the not-in-set
+/// comparison changed, from 32 bytes to 20, and it is a pure relaxation: the 12
+/// bytes it stopped comparing are the constant zero padding this codec still
+/// writes, so no record that used to verify stops verifying.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct U256Balance;
+
+impl RecordCodec for U256Balance {
+    type Value = Balance;
+
+    fn encode(value: &Balance) -> [u8; PAYLOAD_BYTES] {
+        let mut payload = [0u8; PAYLOAD_BYTES];
+        payload[12..].copy_from_slice(value);
+        payload
+    }
+
+    fn decode(bytes: &[u8; PAYLOAD_BYTES]) -> Balance {
+        let mut value = [0u8; 32];
+        value.copy_from_slice(&bytes[12..]);
+        value
+    }
+}
 
 /// The fixed deployment shape: the 2 GiB `InsPIRe2-g32-2GiB-c65536` geometry
 /// carrying 64 B records, for a capacity of 33,554,432 addresses.
@@ -116,17 +170,18 @@ pub(crate) fn eth_error_to_io(error: EthPirError) -> std::io::Error {
     std::io::Error::new(kind, error)
 }
 
-pub(crate) fn address_slot(addr: &Address) -> [u8; 32] {
-    let mut slot = [0u8; 32];
-    slot[..20].copy_from_slice(addr);
-    slot
-}
-
-pub(crate) fn record_of(addr: &Address, value: &Balance) -> Record {
+pub(crate) fn record_of<C: RecordCodec>(addr: &Address, value: &C::Value) -> Record {
     let mut record = [0u8; 64];
     record[..20].copy_from_slice(addr);
-    record[32..].copy_from_slice(value);
+    record[20..].copy_from_slice(&C::encode(value));
     record
+}
+
+/// The codec's half of a record.
+pub(crate) fn payload_of(record: &Record) -> &[u8; PAYLOAD_BYTES] {
+    record[20..]
+        .try_into()
+        .expect("a record is 20 address bytes followed by PAYLOAD_BYTES")
 }
 
 #[cfg(test)]

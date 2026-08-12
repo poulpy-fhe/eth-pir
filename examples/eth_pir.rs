@@ -312,7 +312,7 @@ fn main() {
         let stop = stop.clone();
         let blob = blob.clone();
         std::thread::spawn(move || {
-            let mut client = EthPirClient::new(&blob).expect("load-generator client");
+            let mut client: EthPirClient = EthPirClient::new(&blob).expect("load-generator client");
             let (mut served, mut before, mut after) = (0u64, 0u64, 0u64);
             let mut worst = std::time::Duration::ZERO;
             while !stop.load(Ordering::Relaxed) {

@@ -1,14 +1,15 @@
 //! Client side: keyword helper, query generation, and response decryption.
 
 use std::io::Result as IoResult;
+use std::marker::PhantomData;
 
 use poulpy_pir::client::{Client, QueryState};
 use poulpy_pir::keyword::KeywordDirectory;
 use poulpy_pir::payload::U512P65536;
 
 use crate::{
-    Address, Balance, DefaultBackend, EthPirError, EthQuery, EthResponse, address_slot,
-    default_shape, eth_error_to_io,
+    Address, DefaultBackend, EthPirError, EthQuery, EthResponse, RecordCodec, U256Balance,
+    default_shape, eth_error_to_io, payload_of,
 };
 
 /// Per-lookup client state.
@@ -18,12 +19,18 @@ pub struct LookupState {
 }
 
 /// ETH PIR client. Holds a synced keyword directory and PIR query material.
-pub struct EthPirClient {
+///
+/// Generic over the [`RecordCodec`] the server writes with; the two must agree,
+/// since nothing on the wire identifies the layout.
+pub struct EthPirClient<C: RecordCodec = U256Balance> {
     directory: KeywordDirectory<20>,
     client: Client<DefaultBackend, U512P65536>,
+    /// `fn() -> C` rather than `C`: the codec is a compile-time marker the
+    /// client never holds a value of, and this stays `Send + Sync` regardless.
+    codec: PhantomData<fn() -> C>,
 }
 
-impl EthPirClient {
+impl<C: RecordCodec> EthPirClient<C> {
     /// Bootstrap from the server's full directory blob at the fixed 2 GiB shape.
     pub fn new(directory_blob: &[u8]) -> IoResult<Self> {
         Self::try_new(directory_blob).map_err(eth_error_to_io)
@@ -53,6 +60,7 @@ impl EthPirClient {
         Ok(Self {
             directory: KeywordDirectory::read_from(&mut { directory_blob })?,
             client: Client::try_new(config, layout)?,
+            codec: PhantomData,
         })
     }
 
@@ -108,22 +116,28 @@ impl EthPirClient {
         &mut self,
         response: &EthResponse,
         lookup: &LookupState,
-    ) -> Result<Balance, EthPirError> {
+    ) -> Result<C::Value, EthPirError> {
         self.try_decrypt(response, lookup)
     }
 
     /// Fallible response decryptor with record-address verification.
+    ///
+    /// The address check is the whole reason a record carries its own key: the
+    /// keyword index is a *minimal perfect* hash, so it maps an address the
+    /// server never indexed onto some arbitrary occupied slot rather than
+    /// failing. Comparing the prefix is what turns that into [`NotInSet`]
+    /// instead of a confidently wrong value.
+    ///
+    /// [`NotInSet`]: EthPirError::NotInSet
     pub fn try_decrypt(
         &mut self,
         response: &EthResponse,
         lookup: &LookupState,
-    ) -> Result<Balance, EthPirError> {
+    ) -> Result<C::Value, EthPirError> {
         let record = self.client.try_decode(response, &lookup.state)?;
-        if record[..32] != address_slot(&lookup.addr) {
+        if record[..20] != lookup.addr {
             return Err(EthPirError::NotInSet);
         }
-        let mut balance = [0u8; 32];
-        balance.copy_from_slice(&record[32..]);
-        Ok(balance)
+        Ok(C::decode(payload_of(&record)))
     }
 }

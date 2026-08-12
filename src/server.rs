@@ -1,5 +1,6 @@
 //! Server side: the PIR database service and keyword-helper wire service.
 
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -8,8 +9,8 @@ use poulpy_pir::keyword::{KeywordDirectory, KeywordIndex};
 use poulpy_pir::server::Server;
 
 use crate::{
-    Address, Balance, DefaultBackend, EthPirError, EthQuery, EthResponse, Record, default_shape,
-    record_of,
+    Address, DefaultBackend, EthPirError, EthQuery, EthResponse, Record, RecordCodec, U256Balance,
+    default_shape, record_of,
 };
 
 type Payload = poulpy_pir::payload::U512P65536;
@@ -26,7 +27,10 @@ type Serving = Arc<Mutex<PirServer>>;
 /// rebuilds is only what actually depends on the data: the encoded database and
 /// its matching precomputation, which are computed off to the side and swapped
 /// in as a pair.
-pub struct EthPirServer {
+///
+/// Generic over the [`RecordCodec`] that lays out each record's payload. The
+/// client must be built with the same one — nothing on the wire identifies it.
+pub struct EthPirServer<C: RecordCodec = U256Balance> {
     directory: KeywordDirectory<20>,
     /// Plaintext source of truth. Updates land here immediately; they become
     /// *retrievable* only at the next [`rebuild_database`](Self::rebuild_database),
@@ -39,12 +43,15 @@ pub struct EthPirServer {
     staging: PirDatabase,
     /// Updates applied to `records` since the last rebuild.
     pending: usize,
+    /// `fn() -> C` rather than `C`: the codec is a compile-time marker the
+    /// server never holds a value of, and this stays `Send + Sync` regardless.
+    codec: PhantomData<fn() -> C>,
 }
 
-impl EthPirServer {
-    /// Instantiates DB + keyword helper from the initial address -> balance map
+impl<C: RecordCodec> EthPirServer<C> {
+    /// Instantiates DB + keyword helper from the initial address -> value map
     /// at the fixed 2 GiB shape.
-    pub fn init(map: &std::collections::HashMap<Address, Balance>) -> Result<Self, EthPirError> {
+    pub fn init(map: &std::collections::HashMap<Address, C::Value>) -> Result<Self, EthPirError> {
         let (config, layout) = default_shape();
         Self::init_with(config, layout, map)
     }
@@ -53,7 +60,7 @@ impl EthPirServer {
     pub fn init_with(
         config: poulpy_pir::config::Config<Payload>,
         layout: poulpy_pir::database::DatabaseLayout<Payload>,
-        map: &std::collections::HashMap<Address, Balance>,
+        map: &std::collections::HashMap<Address, C::Value>,
     ) -> Result<Self, EthPirError> {
         Self::init_with_timed(config, layout, map).map(|(server, _)| server)
     }
@@ -62,7 +69,7 @@ impl EthPirServer {
     pub fn init_with_timed(
         config: poulpy_pir::config::Config<Payload>,
         layout: poulpy_pir::database::DatabaseLayout<Payload>,
-        map: &std::collections::HashMap<Address, Balance>,
+        map: &std::collections::HashMap<Address, C::Value>,
     ) -> Result<(Self, InitTimings), EthPirError> {
         let mut timings = InitTimings::default();
 
@@ -76,7 +83,7 @@ impl EthPirServer {
         let t = Instant::now();
         let mut records = zeroed_records(map.len());
         scatter_records(&mut records, &keys, |_, addr| {
-            (directory.index(addr), record_of(addr, &map[addr]))
+            (directory.index(addr), record_of::<C>(addr, &map[addr]))
         });
         timings.records_scatter = t.elapsed();
 
@@ -113,26 +120,27 @@ impl EthPirServer {
                 serving: Arc::new(Mutex::new(server)),
                 staging,
                 pending: 0,
+                codec: PhantomData,
             },
             timings,
         ))
     }
 
-    /// Apply one address -> balance update.
+    /// Apply one address -> value update.
     ///
     /// The value is written straight into the plaintext records. New addresses
     /// are appended to the keyword helper immediately and become visible through
-    /// delta sync; either way the balance becomes *retrievable* only after the
+    /// delta sync; either way the value becomes *retrievable* only after the
     /// next [`rebuild_database`](Self::rebuild_database), which is what
     /// re-encodes and re-preprocesses the served database.
-    pub fn update(&mut self, addr: Address, value: Balance) -> Result<(), EthPirError> {
+    pub fn update(&mut self, addr: Address, value: C::Value) -> Result<(), EthPirError> {
         let i = self.directory.index(&addr);
         if i < self.records.len() && self.records[i][..20] == addr {
-            self.records[i] = record_of(&addr, &value);
+            self.records[i] = record_of::<C>(&addr, &value);
         } else {
             let appended = self.directory.push(&addr)?;
             debug_assert_eq!(appended, self.records.len());
-            self.records.push(record_of(&addr, &value));
+            self.records.push(record_of::<C>(&addr, &value));
         }
         self.pending += 1;
         Ok(())
