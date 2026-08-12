@@ -12,8 +12,8 @@ mod server;
 pub use client::{EthPirClient, LookupState};
 
 pub use server::{
-    EthPirResponder, EthPirServer, InitTimings, KeywordRebuildTimings, KeywordWire, MemoryReport,
-    RefreshTimings,
+    EthPirResponder, EthPirServer, InitTimings, KeywordRebuildTimings, KeywordSyncMode,
+    KeywordWire, MemoryReport, RefreshTimings,
 };
 
 use poulpy_pir::config::{Collapse, Config};

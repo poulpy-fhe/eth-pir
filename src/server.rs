@@ -188,10 +188,27 @@ impl<C: RecordCodec> EthPirServer<C> {
     /// [`resync`](crate::EthPirClient::resync) afterwards, since every index
     /// moves.
     pub fn rebuild_keyword_index(&mut self) -> Result<KeywordRebuildTimings, EthPirError> {
+        let t = Instant::now();
+        let map = records_to_map::<C>(&self.records);
+        let mut timings = self.rebuild_keyword_index_from(&map)?;
+        timings.collect_keys = t.elapsed();
+        Ok(timings)
+    }
+
+    /// Rebuild the keyword index from a caller-supplied current key set.
+    ///
+    /// Use this when the served set is not append-only. The supplied `map` is
+    /// the complete current set; keys absent from it disappear from the rebuilt
+    /// MPHF. The directory version is bumped, so clients can distinguish this
+    /// from an append-only delta and must fetch a full directory blob.
+    pub fn rebuild_keyword_index_from(
+        &mut self,
+        map: &std::collections::HashMap<Address, C::Value>,
+    ) -> Result<KeywordRebuildTimings, EthPirError> {
         let mut timings = KeywordRebuildTimings::default();
 
         let t = Instant::now();
-        let keys = collect_addresses(&self.records);
+        let keys: Vec<Address> = map.keys().copied().collect();
         timings.collect_keys = t.elapsed();
 
         let t = Instant::now();
@@ -199,9 +216,9 @@ impl<C: RecordCodec> EthPirServer<C> {
         timings.mphf_rebuild = t.elapsed();
 
         let t = Instant::now();
-        let mut records = zeroed_records(self.records.len());
-        scatter_records(&mut records, &keys, |i, key| {
-            (next.index(key), self.records[i])
+        let mut records = zeroed_records(keys.len());
+        scatter_records(&mut records, &keys, |_, key| {
+            (next.index(key), record_of::<C>(key, &map[key]))
         });
         timings.permute = t.elapsed();
 
@@ -500,27 +517,16 @@ where
     });
 }
 
-/// The address prefix of every record, in record order.
-fn collect_addresses(records: &[Record]) -> Vec<Address> {
-    let mut keys = vec![[0u8; 20]; records.len()];
-    let workers = worker_count(records.len());
-    if workers <= 1 {
-        for (key, record) in keys.iter_mut().zip(records) {
-            key.copy_from_slice(&record[..20]);
-        }
-        return keys;
+fn records_to_map<C: RecordCodec>(
+    records: &[Record],
+) -> std::collections::HashMap<Address, C::Value> {
+    let mut map = std::collections::HashMap::with_capacity(records.len());
+    for record in records {
+        let mut key = [0u8; 20];
+        key.copy_from_slice(&record[..20]);
+        map.insert(key, C::decode(crate::payload_of(record)));
     }
-    let per = records.len().div_ceil(workers);
-    std::thread::scope(|scope| {
-        for (dst, src) in keys.chunks_mut(per).zip(records.chunks(per)) {
-            scope.spawn(move || {
-                for (key, record) in dst.iter_mut().zip(src) {
-                    key.copy_from_slice(&record[..20]);
-                }
-            });
-        }
-    });
-    keys
+    map
 }
 
 /// The keyword-helper service as its own API surface.
@@ -528,10 +534,37 @@ pub struct KeywordWire<'a> {
     directory: &'a KeywordDirectory<20>,
 }
 
+/// Which keyword-directory payload a client needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeywordSyncMode {
+    /// The client's MPHF generation differs from the server's. It must fetch
+    /// [`KeywordWire::full`] and call `EthPirClient::resync`.
+    Full,
+    /// Same MPHF generation. The client can fetch only the append-only delta
+    /// tail starting at `from` and call `EthPirClient::apply_tail`.
+    Tail { from: usize },
+}
+
 impl KeywordWire<'_> {
     /// MPHF generation.
     pub fn version(&self) -> u64 {
         self.directory.version()
+    }
+
+    /// Decide whether a client can apply a delta tail or must fully resync.
+    ///
+    /// A version mismatch means the MPHF has been rebuilt. Every index may have
+    /// moved, and in pruning deployments some old keys may have disappeared, so
+    /// an append-only tail is not meaningful. The endpoint must send
+    /// [`full`](Self::full) in that case.
+    pub fn sync_mode(&self, client_version: u64, client_tail_len: usize) -> KeywordSyncMode {
+        if client_version == self.version() {
+            KeywordSyncMode::Tail {
+                from: client_tail_len,
+            }
+        } else {
+            KeywordSyncMode::Full
+        }
     }
 
     /// Full directory blob for bootstrap and post-rebuild resync.
@@ -569,6 +602,31 @@ impl KeywordWire<'_> {
         let mut tail = Vec::new();
         self.directory.write_delta_envelope_from(&mut tail, have)?;
         Ok(tail)
+    }
+}
+
+#[cfg(test)]
+mod keyword_sync_tests {
+    use super::*;
+
+    fn key(byte: u8) -> Address {
+        [byte; 20]
+    }
+
+    fn wire_for(version: u64) -> KeywordDirectory<20> {
+        let keys = [key(1), key(2), key(3)];
+        KeywordDirectory::new(KeywordIndex::build(&keys).unwrap(), 16, version).unwrap()
+    }
+
+    #[test]
+    fn sync_mode_forces_full_resync_after_mphf_generation_change() {
+        let directory = wire_for(8);
+        let wire = KeywordWire {
+            directory: &directory,
+        };
+
+        assert_eq!(wire.sync_mode(7, 0), KeywordSyncMode::Full);
+        assert_eq!(wire.sync_mode(8, 2), KeywordSyncMode::Tail { from: 2 });
     }
 }
 

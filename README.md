@@ -234,6 +234,9 @@ touched:
   layout matches, and only then publishes the new directory version. Every index
   moves, so clients must `resync()` afterwards. Run it when the delta has grown
   enough to be worth compacting — ~11.4 s, dominated by MPHF construction.
+- `rebuild_keyword_index_from(map)` is the prune-aware variant: the supplied map
+  is the complete current key set, so keys missing from it disappear from the
+  rebuilt MPHF. It also bumps the directory version, so clients must `resync()`.
 
 Both return their per-step timings. `rebuild_database` returns `None` when
 nothing was pending.
@@ -286,6 +289,8 @@ impl EthPirServer {
     /// rebuild the database to match, publishing the new directory version last.
     /// Every index moves, so clients must `resync()` afterwards.
     pub fn rebuild_keyword_index(&mut self) -> Result<KeywordRebuildTimings, EthPirError>;
+    pub fn rebuild_keyword_index_from(&mut self, map: &HashMap<Address, Balance>)
+        -> Result<KeywordRebuildTimings, EthPirError>;
 
     /// Answer queries. The server never learns which address was asked for.
     /// Batching amortizes the database pass; see Performance for the tradeoff.
@@ -317,12 +322,18 @@ impl EthPirResponder {                      // + Clone
 
 impl KeywordWire<'_> {
     pub fn version(&self) -> u64;                    // MPHF generation
+    pub fn sync_mode(&self, client_version: u64, client_tail_len: usize) -> KeywordSyncMode;
     pub fn full(&self) -> Vec<u8>;                   // bootstrap / post-rebuild resync blob
     pub fn try_full(&self) -> io::Result<Vec<u8>>;
     pub fn mphf(&self) -> Vec<u8>;                   // MPHF parameters alone
     pub fn try_mphf(&self) -> io::Result<Vec<u8>>;
     pub fn tail(&self, have: usize) -> Vec<u8>;      // validated append-only tail
     pub fn try_tail(&self, have: usize) -> io::Result<Vec<u8>>;
+}
+
+pub enum KeywordSyncMode {
+    Full,                     // client must redownload full directory/resync
+    Tail { from: usize },     // client may fetch/apply append-only tail
 }
 
 // ---- Client -------------------------------------------------------------
