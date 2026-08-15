@@ -99,6 +99,50 @@ impl<C: RecordCodec> EthPirClient<C> {
         Ok(())
     }
 
+    /// The database slot `addr` resolves to through the directory.
+    ///
+    /// Total, like the MPHF beneath it: an address the server never indexed
+    /// still yields a valid slot belonging to some other address. Diagnostics
+    /// only — a lookup must still go through [`try_query`](Self::try_query) and
+    /// the address check in [`try_decrypt`](Self::try_decrypt).
+    pub fn slot(&self, addr: &Address) -> usize {
+        self.directory.index(addr)
+    }
+
+    /// Serialize a query for transport.
+    pub fn encode_query(&self, query: &EthQuery) -> Result<Vec<u8>, EthPirError> {
+        let mut bytes = Vec::new();
+        query.write_to(self.client.params().module(), &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Build a PIR query for an ETH address, serialized for transport.
+    pub fn try_query_bytes(
+        &mut self,
+        addr: Address,
+    ) -> Result<(Vec<u8>, LookupState), EthPirError> {
+        let (query, lookup) = self.try_query(addr)?;
+        Ok((self.encode_query(&query)?, lookup))
+    }
+
+    /// Parse a response received from a server.
+    pub fn decode_response(&self, bytes: &[u8]) -> Result<EthResponse, EthPirError> {
+        Ok(EthResponse::read_from(
+            &mut { bytes },
+            self.client.params(),
+        )?)
+    }
+
+    /// Parse a serialized response and decrypt it in one step.
+    pub fn try_decrypt_bytes(
+        &mut self,
+        bytes: &[u8],
+        lookup: &LookupState,
+    ) -> Result<C::Value, EthPirError> {
+        let response = self.decode_response(bytes)?;
+        self.try_decrypt(&response, lookup)
+    }
+
     /// Build a PIR query for an ETH address.
     pub fn query(&mut self, addr: Address) -> (EthQuery, LookupState) {
         self.try_query(addr).unwrap_or_else(|err| panic!("{err}"))
